@@ -54,6 +54,16 @@ export interface LiveSession {
   abort: (reason?: string) => void;
   startTime: number;
   firstTokenTime?: number;
+  /**
+   * Send a steering message - interrupts current generation and injects message.
+   * Equivalent to pressing Enter while streaming in Pi TUI.
+   */
+  steer: (text: string) => Promise<void>;
+  /**
+   * Send a follow-up message - queues until current generation completes.
+   * Equivalent to pressing Alt+Enter while streaming in Pi TUI.
+   */
+  followUp: (text: string) => Promise<void>;
 }
 
 let liveSessions = new Map<string, LiveSession>();

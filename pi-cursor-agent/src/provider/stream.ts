@@ -59,6 +59,7 @@ import {
   setLiveSession,
 } from "./agent-stream-hook";
 import { toCursorId } from "./model-mapping";
+import { createMessageDispatcher } from "./pending-messages";
 import { type CursorStateStore, createOverlayState } from "./state";
 
 function createCheckpointHandler(
@@ -475,30 +476,47 @@ export function streamCursorAgent(
         checkpointHandler.getLatestCheckpoint = () =>
           agentStore.getConversationStateStructure();
 
+        // Dispatcher for mid-stream user messages (steer / followUp).
+        // It re-binds on every (re)connect so that messages stranded by a
+        // dropped connection are redelivered as soon as a new stream opens.
+        const dispatcher = createMessageDispatcher();
+
         const runOptions: Parameters<typeof connectClient.run>[1] = {
           interactionListener,
           resources,
           blobStore,
           checkpointHandler,
           signal: sessionSignal,
+          onRequestStreamCreated: (stream) => {
+            // Best-effort bind. Errors here would otherwise propagate into
+            // connect.ts and abort the run; the dispatcher already handles
+            // write failures internally by re-queueing messages.
+            void dispatcher.bind(stream).catch(() => {});
+          },
         };
 
         const cursorRunPromise = connectClient
           .run(initialRequest, runOptions)
           .then(() => channel.push({ kind: "cursor-done" }))
           .catch(() => channel.push({ kind: "cursor-done" }))
-          .finally(() => channel.markDone());
+          .finally(() => {
+            dispatcher.close();
+            channel.markDone();
+          });
 
         session = {
           channel,
           cursorRunPromise,
           flushSessionState,
           abort: (reason) => {
+            dispatcher.close();
             sessionAbortController.abort(
               reason ? new Error(reason) : new Error("Session ended"),
             );
           },
           startTime: Date.now(),
+          steer: (text) => dispatcher.steer(text),
+          followUp: (text) => dispatcher.followUp(text),
         };
         setLiveSession(sessionId, session);
       }

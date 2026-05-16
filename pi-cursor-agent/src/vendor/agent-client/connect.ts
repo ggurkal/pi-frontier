@@ -1,4 +1,7 @@
-import { createWritableIterable } from "@connectrpc/connect/protocol";
+import {
+  createWritableIterable,
+  type WritableIterable,
+} from "@connectrpc/connect/protocol";
 import {
   AgentClientMessage,
   AgentRunRequest,
@@ -52,6 +55,13 @@ export interface AgentConnectRunOptions {
   onConnectionStateChange?: (state: {
     state: "reconnecting" | "connected";
   }) => void;
+  /**
+   * Called when the request stream is created, allowing mid-stream messages
+   * to be sent (e.g., steering and follow-up messages).
+   */
+  onRequestStreamCreated?: (
+    stream: WritableIterable<AgentClientMessage>,
+  ) => void;
 }
 
 const HEARTBEAT_INTERVAL_MS = 5_000;
@@ -222,7 +232,12 @@ export class AgentConnectClient {
 
     const baseRequestStream = createWritableIterable<AgentClientMessage>();
 
+    // Queue the initial run request first so replayed mid-stream messages
+    // cannot overtake the run handshake on reconnect.
     void baseRequestStream.write(initialRequest);
+
+    // Notify consumer after the initial request is queued.
+    options.onRequestStreamCreated?.(baseRequestStream);
 
     const runOptions: {
       signal?: AbortSignal;
