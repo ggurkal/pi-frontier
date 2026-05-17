@@ -50,16 +50,15 @@ export class PendingMessageQueue {
 
   drain(): string[] {
     if (this.mode === "all") {
-      const drained = this.messages.slice();
-      this.messages = [];
-      return drained;
+      return this.messages.splice(0, this.messages.length);
     }
 
-    const first = this.messages[0];
+    const [first] = this.messages.splice(0, 1);
+
     if (first === undefined) {
       return [];
     }
-    this.messages = this.messages.slice(1);
+
     return [first];
   }
 
@@ -71,7 +70,8 @@ export class PendingMessageQueue {
     if (items.length === 0) {
       return;
     }
-    this.messages = [...items, ...this.messages];
+
+    this.messages.unshift(...items);
   }
 
   get size(): number {
