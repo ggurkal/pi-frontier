@@ -30,6 +30,8 @@ function createLiveSession(label: string) {
     flushSessionState: async () => {},
     abort: () => {},
     startTime: Date.now(),
+    steer: async () => {},
+    followUp: async () => {},
   };
 }
 
@@ -89,6 +91,8 @@ test("terminateSession aborts the live session and rejects pending tool results"
       resolveRun();
     },
     startTime: Date.now(),
+    steer: async () => {},
+    followUp: async () => {},
   };
   setLiveSession("session-a", session);
 
