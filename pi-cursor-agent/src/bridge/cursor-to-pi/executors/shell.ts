@@ -74,13 +74,430 @@ export function buildShellRejectedResult(
   });
 }
 
-function isDangerousShellCommand(command: string): boolean {
-  const c = command.toLowerCase();
-  if (/(^|\s)sudo\b/.test(c)) return true;
-  if (/\brm\b.*\s-rf\b/.test(c)) return true;
-  if (/\bmkfs\b|\bdd\b|\bshutdown\b|\breboot\b/.test(c)) return true;
-  if (/\bcurl\b.*\|\s*(sh|bash)\b/.test(c)) return true;
-  if (/\bwget\b.*\|\s*(sh|bash)\b/.test(c)) return true;
+type ShellLexeme =
+  | { type: "token"; value: string }
+  | { type: "operator"; value: string };
+
+interface ShellSegment {
+  tokens: string[];
+  trailingOperator?: string;
+}
+
+interface ResolvedExecutable {
+  name: string;
+  index: number;
+}
+
+const DANGEROUS_EXECUTABLES = new Set(["dd", "shutdown", "reboot"]);
+const WRAPPER_EXECUTABLES = new Set([
+  "sudo",
+  "env",
+  "command",
+  "builtin",
+  "nohup",
+  "time",
+]);
+const NETWORK_FETCH_EXECUTABLES = new Set(["curl", "wget"]);
+const SHELL_INTERPRETERS = new Set(["sh", "bash", "zsh", "dash", "ksh"]);
+
+function tokenizeShell(command: string): ShellLexeme[] {
+  const lexemes: ShellLexeme[] = [];
+  let current = "";
+  let quote: "'" | '"' | null = null;
+  let i = 0;
+
+  const pushToken = () => {
+    if (!current) {
+      return;
+    }
+    lexemes.push({ type: "token", value: current });
+    current = "";
+  };
+
+  while (i < command.length) {
+    const ch = command[i] ?? "";
+
+    if (quote === null) {
+      if (ch === "'" || ch === '"') {
+        quote = ch;
+        i += 1;
+        continue;
+      }
+
+      if (ch === "\\") {
+        const next = command[i + 1];
+        if (next !== undefined) {
+          current += next;
+          i += 2;
+          continue;
+        }
+        i += 1;
+        continue;
+      }
+
+      if (ch === "\n") {
+        pushToken();
+        lexemes.push({ type: "operator", value: "\n" });
+        i += 1;
+        continue;
+      }
+
+      if (ch === " " || ch === "\t" || ch === "\r") {
+        pushToken();
+        i += 1;
+        continue;
+      }
+
+      if (ch === "&") {
+        pushToken();
+        if (command[i + 1] === "&") {
+          lexemes.push({ type: "operator", value: "&&" });
+          i += 2;
+        } else {
+          lexemes.push({ type: "operator", value: "&" });
+          i += 1;
+        }
+        continue;
+      }
+
+      if (ch === "|") {
+        pushToken();
+        if (command[i + 1] === "|") {
+          lexemes.push({ type: "operator", value: "||" });
+          i += 2;
+        } else if (command[i + 1] === "&") {
+          lexemes.push({ type: "operator", value: "|&" });
+          i += 2;
+        } else {
+          lexemes.push({ type: "operator", value: "|" });
+          i += 1;
+        }
+        continue;
+      }
+
+      if (ch === ";") {
+        pushToken();
+        lexemes.push({ type: "operator", value: ";" });
+        i += 1;
+        continue;
+      }
+
+      current += ch;
+      i += 1;
+      continue;
+    }
+
+    if (quote === "'") {
+      if (ch === "'") {
+        quote = null;
+      } else {
+        current += ch;
+      }
+      i += 1;
+      continue;
+    }
+
+    if (ch === '"') {
+      quote = null;
+      i += 1;
+      continue;
+    }
+
+    if (ch === "\\") {
+      const next = command[i + 1];
+      if (
+        next === '"' ||
+        next === "\\" ||
+        next === "$" ||
+        next === "`" ||
+        next === "\n"
+      ) {
+        current += next;
+        i += 2;
+        continue;
+      }
+    }
+
+    current += ch;
+    i += 1;
+  }
+
+  pushToken();
+  return lexemes;
+}
+
+function splitIntoSegments(lexemes: ShellLexeme[]): ShellSegment[] {
+  const segments: ShellSegment[] = [];
+  let current: string[] = [];
+
+  for (const lexeme of lexemes) {
+    if (lexeme.type === "token") {
+      current.push(lexeme.value);
+      continue;
+    }
+
+    if (current.length > 0) {
+      segments.push({ tokens: current, trailingOperator: lexeme.value });
+      current = [];
+    }
+  }
+
+  if (current.length > 0) {
+    segments.push({ tokens: current });
+  }
+
+  return segments;
+}
+
+function isEnvAssignment(token: string): boolean {
+  return /^[A-Za-z_][A-Za-z0-9_]*=.*/.test(token);
+}
+
+function normalizeExecutableName(token: string): string {
+  const unescaped = token.replace(/^\\+/, "");
+  const parts = unescaped.split("/");
+  const base = parts[parts.length - 1] ?? unescaped;
+  return base.toLowerCase();
+}
+
+function resolveExecutable(tokens: string[]): ResolvedExecutable | null {
+  let index = 0;
+
+  while (index < tokens.length) {
+    const token = tokens[index] ?? "";
+
+    if (token === "--") {
+      index += 1;
+      continue;
+    }
+
+    if (isEnvAssignment(token)) {
+      index += 1;
+      continue;
+    }
+
+    const name = normalizeExecutableName(token);
+    if (!name) {
+      index += 1;
+      continue;
+    }
+
+    if (!WRAPPER_EXECUTABLES.has(name)) {
+      return { name, index };
+    }
+
+    index += 1;
+
+    if (name === "sudo") {
+      while (index < tokens.length) {
+        const value = tokens[index] ?? "";
+        if (value === "--") {
+          index += 1;
+          break;
+        }
+        if (value.startsWith("-")) {
+          index += 1;
+          continue;
+        }
+        break;
+      }
+      continue;
+    }
+
+    if (name === "env") {
+      while (index < tokens.length) {
+        const value = tokens[index] ?? "";
+        if (value === "--") {
+          index += 1;
+          break;
+        }
+        if (value.startsWith("-") || isEnvAssignment(value)) {
+          index += 1;
+          continue;
+        }
+        break;
+      }
+      continue;
+    }
+
+    while (index < tokens.length) {
+      const value = tokens[index] ?? "";
+      if (value === "--") {
+        index += 1;
+        break;
+      }
+      if (value.startsWith("-")) {
+        index += 1;
+        continue;
+      }
+      break;
+    }
+  }
+
+  return null;
+}
+
+function hasSudoPrefix(tokens: string[]): boolean {
+  let index = 0;
+  while (index < tokens.length && isEnvAssignment(tokens[index] ?? "")) {
+    index += 1;
+  }
+
+  while (index < tokens.length) {
+    const token = tokens[index] ?? "";
+    if (token === "--") {
+      index += 1;
+      continue;
+    }
+
+    const name = normalizeExecutableName(token);
+    if (!name) {
+      index += 1;
+      continue;
+    }
+
+    if (name === "sudo") {
+      return true;
+    }
+
+    if (!WRAPPER_EXECUTABLES.has(name)) {
+      return false;
+    }
+
+    index += 1;
+
+    if (name === "env") {
+      while (index < tokens.length) {
+        const value = tokens[index] ?? "";
+        if (value === "--") {
+          index += 1;
+          break;
+        }
+        if (value.startsWith("-") || isEnvAssignment(value)) {
+          index += 1;
+          continue;
+        }
+        break;
+      }
+      continue;
+    }
+
+    while (index < tokens.length) {
+      const value = tokens[index] ?? "";
+      if (value === "--") {
+        index += 1;
+        break;
+      }
+      if (value.startsWith("-")) {
+        index += 1;
+        continue;
+      }
+      break;
+    }
+  }
+
+  return false;
+}
+
+function hasRecursiveForceFlags(
+  tokens: string[],
+  executableIndex: number,
+): boolean {
+  let hasRecursive = false;
+  let hasForce = false;
+
+  for (let i = executableIndex + 1; i < tokens.length; i += 1) {
+    const token = tokens[i] ?? "";
+
+    if (token.startsWith("--")) {
+      if (token === "--recursive") {
+        hasRecursive = true;
+      }
+      if (token === "--force") {
+        hasForce = true;
+      }
+    } else if (token.startsWith("-") && token.length > 1) {
+      const flags = token.slice(1);
+      if (flags.includes("r") || flags.includes("R")) {
+        hasRecursive = true;
+      }
+      if (flags.includes("f")) {
+        hasForce = true;
+      }
+    }
+
+    if (hasRecursive && hasForce) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+export function isDangerousShellCommand(command: string): boolean {
+  const segments = splitIntoSegments(tokenizeShell(command));
+  if (segments.length === 0) {
+    return false;
+  }
+
+  const resolved = segments.map((segment) => ({
+    ...segment,
+    executable: resolveExecutable(segment.tokens),
+    hasSudoPrefix: hasSudoPrefix(segment.tokens),
+  }));
+
+  if (resolved.some((segment) => segment.hasSudoPrefix)) {
+    return true;
+  }
+
+  for (const segment of resolved) {
+    const executable = segment.executable;
+    if (!executable) {
+      continue;
+    }
+
+    if (
+      executable.name === "rm" &&
+      hasRecursiveForceFlags(segment.tokens, executable.index)
+    ) {
+      return true;
+    }
+
+    if (executable.name.startsWith("mkfs")) {
+      return true;
+    }
+
+    if (DANGEROUS_EXECUTABLES.has(executable.name)) {
+      return true;
+    }
+  }
+
+  for (let i = 0; i < resolved.length - 1; i += 1) {
+    const left = resolved[i];
+    const right = resolved[i + 1];
+    if (!left || !right) {
+      continue;
+    }
+
+    if (left.trailingOperator !== "|" && left.trailingOperator !== "|&") {
+      continue;
+    }
+
+    const leftCommand = left.executable?.name;
+    const rightCommand = right.executable?.name;
+
+    if (!leftCommand || !rightCommand) {
+      continue;
+    }
+
+    if (
+      NETWORK_FETCH_EXECUTABLES.has(leftCommand) &&
+      SHELL_INTERPRETERS.has(rightCommand)
+    ) {
+      return true;
+    }
+  }
+
   return false;
 }
 
