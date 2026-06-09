@@ -51,11 +51,16 @@ import {
   persistAgentStore,
 } from "./agent-store";
 import {
+  type ChannelEvent,
   type ContentEvent,
+  consumeInputIntentForText,
   deleteLiveSession,
   getLiveSession,
+  hasSeenContextUserMessageKey,
   LiveEventChannel,
   type LiveSession,
+  markSeenContextUserMessageKey,
+  queueInputIntent,
   setLiveSession,
 } from "./agent-stream-hook";
 import { toCursorId } from "./model-mapping";
@@ -81,6 +86,10 @@ const ABORT_ERROR_NAME = "AbortError";
 const REQUEST_CANCELLED_MESSAGE = "Request cancelled";
 const SESSION_ENDED_MESSAGE = "Session ended";
 const REQUEST_ABORTED_MESSAGE = "Request aborted";
+const USER_ABORTED_REQUEST_MESSAGE = "User aborted request";
+const STEER_ABORT_GRACE_WINDOW_MS = 2_000;
+const CURSOR_ABORT_BRACKET_PATTERN =
+  /\[(?:canceled|aborted)\].*\[(?:canceled|aborted)\]/i;
 
 function isAbortLikeError(error: unknown, signal?: AbortSignal): boolean {
   if (signal?.aborted) {
@@ -99,8 +108,45 @@ function isAbortLikeError(error: unknown, signal?: AbortSignal): boolean {
     error.name === ABORT_ERROR_NAME ||
     error.message === REQUEST_CANCELLED_MESSAGE ||
     error.message === SESSION_ENDED_MESSAGE ||
-    error.message === REQUEST_ABORTED_MESSAGE
+    error.message === REQUEST_ABORTED_MESSAGE ||
+    error.message === USER_ABORTED_REQUEST_MESSAGE ||
+    error.message.includes(USER_ABORTED_REQUEST_MESSAGE) ||
+    CURSOR_ABORT_BRACKET_PATTERN.test(error.message)
   );
+}
+
+async function awaitChannelEvent(
+  channel: LiveEventChannel,
+  signal?: AbortSignal,
+): Promise<ChannelEvent | null> {
+  if (!signal) {
+    return channel.next();
+  }
+
+  if (signal.aborted) {
+    throw signal.reason instanceof Error
+      ? signal.reason
+      : new Error(REQUEST_CANCELLED_MESSAGE);
+  }
+
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () =>
+      reject(
+        signal.reason instanceof Error
+          ? signal.reason
+          : new Error(REQUEST_CANCELLED_MESSAGE),
+      );
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+
+  try {
+    return await Promise.race([channel.next(), aborted]);
+  } finally {
+    if (onAbort) {
+      signal.removeEventListener("abort", onAbort);
+    }
+  }
 }
 
 function createInteractionListenerAdapter(
@@ -263,6 +309,7 @@ async function consumeUntilBoundary(
   stream: AssistantMessageEventStream,
   usageState: { sawTokenDelta: boolean },
   setFirstTokenTime: () => void,
+  signal?: AbortSignal,
 ): Promise<{
   reason: "toolUse" | "stop";
   tools: ToolExecRequest[];
@@ -273,7 +320,7 @@ async function consumeUntilBoundary(
   };
 
   while (true) {
-    const event = await channel.next();
+    const event = await awaitChannelEvent(channel, signal);
 
     if (event === null) {
       finalizeAllContent(contentState, output, stream);
@@ -369,6 +416,81 @@ function emitToolCalls(
   }
 }
 
+function extractUserMessageText(
+  message: Context["messages"][number],
+): string | null {
+  if (message.role !== "user") {
+    return null;
+  }
+  if (typeof message.content === "string") {
+    const text = message.content.trim();
+    return text.length > 0 ? text : null;
+  }
+  const text = message.content
+    .filter(
+      (block): block is { type: "text"; text: string } => block.type === "text",
+    )
+    .map((block) => block.text)
+    .join("\n")
+    .trim();
+  return text.length > 0 ? text : null;
+}
+
+function buildContextUserMessageKey(
+  message: Context["messages"][number],
+  text: string,
+): string {
+  return `${message.timestamp}:${text}`;
+}
+
+function markContextUserMessagesSeen(
+  sessionId: string,
+  context: Context,
+): void {
+  for (const message of context.messages) {
+    const text = extractUserMessageText(message);
+    if (!text) continue;
+    markSeenContextUserMessageKey(
+      sessionId,
+      buildContextUserMessageKey(message, text),
+    );
+  }
+}
+
+async function bridgeQueuedInteractiveInputs(
+  sessionId: string,
+  context: Context,
+  liveSession: LiveSession,
+): Promise<void> {
+  for (const message of context.messages) {
+    const text = extractUserMessageText(message);
+    if (!text) {
+      continue;
+    }
+    const key = buildContextUserMessageKey(message, text);
+    if (hasSeenContextUserMessageKey(sessionId, key)) {
+      continue;
+    }
+    const mode = consumeInputIntentForText(sessionId, text);
+    if (!mode) {
+      markSeenContextUserMessageKey(sessionId, key);
+      continue;
+    }
+    try {
+      if (mode === "followUp") {
+        await liveSession.followUp(text);
+      } else {
+        liveSession.markSteerIntent?.();
+        await liveSession.steer(text);
+      }
+      markSeenContextUserMessageKey(sessionId, key);
+    } catch {
+      // Preserve intent for retry on the next stream invocation.
+      queueInputIntent(sessionId, text, mode);
+    }
+  }
+}
+
 export function streamCursorAgent(
   pi: ExtensionAPI,
   getCtx: () => ExtensionContext | null,
@@ -401,6 +523,7 @@ export function streamCursorAgent(
     };
     let session: LiveSession | undefined;
     let effectiveSignal = options?.signal;
+    let steerEpochAtStart = 0;
 
     try {
       session = getLiveSession(sessionId);
@@ -419,10 +542,8 @@ export function streamCursorAgent(
 
         const channel = new LiveEventChannel(sessionId);
         const sessionAbortController = new AbortController();
-        const sessionSignal = options?.signal
-          ? AbortSignal.any([options.signal, sessionAbortController.signal])
-          : sessionAbortController.signal;
-        effectiveSignal = sessionSignal;
+        const sessionSignal = sessionAbortController.signal;
+        effectiveSignal = options?.signal ?? sessionSignal;
 
         const piToolCtx: PiToolContext = {
           cwd,
@@ -487,6 +608,16 @@ export function streamCursorAgent(
             case "token-delta":
               channel.push({ kind: "token-delta", tokens: update.tokens });
               return;
+            case "user-message-appended": {
+              const userMessage = update.userMessage as
+                | { messageId?: unknown }
+                | undefined;
+              const messageId = userMessage?.messageId;
+              if (typeof messageId === "string" && messageId.length > 0) {
+                dispatcher.ackUserMessage(messageId);
+              }
+              return;
+            }
             default:
               return;
           }
@@ -514,6 +645,9 @@ export function streamCursorAgent(
         // It re-binds on every (re)connect so that messages stranded by a
         // dropped connection are redelivered as soon as a new stream opens.
         const dispatcher = createMessageDispatcher();
+        let steerInFlight = 0;
+        let lastSteerAttemptAt = 0;
+        let steerEpoch = 0;
 
         const runOptions: Parameters<typeof connectClient.run>[1] = {
           interactionListener,
@@ -549,36 +683,88 @@ export function streamCursorAgent(
             );
           },
           startTime: Date.now(),
-          steer: (text) => dispatcher.steer(text),
+          steer: async (text) => {
+            steerEpoch++;
+            steerInFlight++;
+            lastSteerAttemptAt = Date.now();
+            try {
+              await dispatcher.steer(text);
+            } finally {
+              steerInFlight = Math.max(0, steerInFlight - 1);
+              lastSteerAttemptAt = Date.now();
+            }
+          },
           followUp: (text) => dispatcher.followUp(text),
+          getSteerEpoch: () => steerEpoch,
+          markSteerIntent: () => {
+            steerEpoch++;
+            lastSteerAttemptAt = Date.now();
+          },
+          wasRecentSteerAttempt: () =>
+            steerInFlight > 0 ||
+            Date.now() - lastSteerAttemptAt <= STEER_ABORT_GRACE_WINDOW_MS,
         };
         setLiveSession(sessionId, session);
+        markContextUserMessagesSeen(sessionId, context);
       }
 
       if (!session) {
         throw new Error(`Failed to initialize live session: ${sessionId}`);
       }
       const liveSession = session;
+      steerEpochAtStart = liveSession.getSteerEpoch?.() ?? 0;
+      await bridgeQueuedInteractiveInputs(sessionId, context, liveSession);
 
       const usageState = { sawTokenDelta: false };
       let firstTokenTimeCaptured = false;
 
       stream.push({ type: "start", partial: output });
 
-      const result = await consumeUntilBoundary(
-        liveSession.channel,
-        output,
-        stream,
-        usageState,
-        () => {
-          if (!firstTokenTimeCaptured) {
-            firstTokenTimeCaptured = true;
-            if (!liveSession.firstTokenTime) {
-              liveSession.firstTokenTime = Date.now();
+      let result: Awaited<ReturnType<typeof consumeUntilBoundary>>;
+      try {
+        result = await consumeUntilBoundary(
+          liveSession.channel,
+          output,
+          stream,
+          usageState,
+          () => {
+            if (!firstTokenTimeCaptured) {
+              firstTokenTimeCaptured = true;
+              if (!liveSession.firstTokenTime) {
+                liveSession.firstTokenTime = Date.now();
+              }
             }
-          }
-        },
-      );
+          },
+          options?.signal,
+        );
+      } catch (error) {
+        const steerAbort =
+          isAbortLikeError(error, options?.signal) &&
+          ((liveSession.getSteerEpoch?.() ?? steerEpochAtStart) >
+            steerEpochAtStart ||
+            liveSession.wasRecentSteerAttempt?.() === true);
+        if (!steerAbort) {
+          throw error;
+        }
+
+        // A steer handoff can abort the current request signal while the
+        // underlying Cursor run is still alive. Continue consuming events from
+        // the live channel so the steered turn can complete normally.
+        result = await consumeUntilBoundary(
+          liveSession.channel,
+          output,
+          stream,
+          usageState,
+          () => {
+            if (!firstTokenTimeCaptured) {
+              firstTokenTimeCaptured = true;
+              if (!liveSession.firstTokenTime) {
+                liveSession.firstTokenTime = Date.now();
+              }
+            }
+          },
+        );
+      }
 
       output.duration = Date.now() - liveSession.startTime;
       if (liveSession.firstTokenTime) {
@@ -629,6 +815,21 @@ export function streamCursorAgent(
       stream.end();
     } catch (error) {
       const wasAborted = isAbortLikeError(error, effectiveSignal);
+      const steerAbort =
+        wasAborted &&
+        ((session?.getSteerEpoch?.() ?? steerEpochAtStart) >
+          steerEpochAtStart ||
+          session?.wasRecentSteerAttempt?.() === true);
+      if (steerAbort) {
+        output.stopReason = "stop";
+        stream.push({ type: "done", reason: "stop", message: output });
+        stream.end();
+        return;
+      }
+
+      if (wasAborted && session && !session.wasRecentSteerAttempt?.()) {
+        session.abort(REQUEST_ABORTED_MESSAGE);
+      }
       output.stopReason = wasAborted ? "aborted" : "error";
       output.errorMessage =
         error instanceof Error ? error.message : String(error);

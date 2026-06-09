@@ -1,5 +1,13 @@
 import type { ToolExecRequest } from "../bridge/cursor-to-pi/tool-bridge";
 
+export type StreamingBehavior = "steer" | "followUp";
+
+export function toStreamingBehavior(
+  value: unknown,
+): StreamingBehavior | undefined {
+  return value === "steer" || value === "followUp" ? value : undefined;
+}
+
 export type ChannelEvent =
   | { kind: "content"; data: ContentEvent }
   | { kind: "tool-exec-request"; request: ToolExecRequest }
@@ -65,9 +73,32 @@ export interface LiveSession {
    * Equivalent to pressing Alt+Enter while streaming in Pi TUI.
    */
   followUp: (text: string) => Promise<void>;
+  /**
+   * Internal signal used to detect request-signal aborts that are side effects
+   * of a steer handoff, so we can avoid surfacing them as hard errors.
+   */
+  wasRecentSteerAttempt?: () => boolean;
+  /**
+   * Internal monotonic steer counter used for deterministic abort attribution.
+   */
+  getSteerEpoch?: () => number;
+  /**
+   * Internal signal used to mark steer intent before async dispatch begins.
+   */
+  markSteerIntent?: () => void;
 }
 
 let liveSessions = new Map<string, LiveSession>();
+
+interface QueuedInputIntent {
+  id: string;
+  text: string;
+  mode: StreamingBehavior;
+  createdAt: number;
+}
+
+let queuedInputIntents = new Map<string, QueuedInputIntent[]>();
+let seenContextUserMessageKeys = new Map<string, Set<string>>();
 
 export function setLiveSession(sessionId: string, session: LiveSession): void {
   liveSessions.set(sessionId, session);
@@ -79,6 +110,8 @@ export function getLiveSession(sessionId: string): LiveSession | undefined {
 
 export function deleteLiveSession(sessionId: string): void {
   liveSessions.delete(sessionId);
+  queuedInputIntents.delete(sessionId);
+  seenContextUserMessageKeys.delete(sessionId);
 }
 
 export function retainOnlyLiveSession(sessionId: string | null): void {
@@ -90,4 +123,68 @@ export function retainOnlyLiveSession(sessionId: string | null): void {
   }
   liveSessions =
     sessionId && retained ? new Map([[sessionId, retained]]) : new Map();
+  const retainedIntents = sessionId
+    ? queuedInputIntents.get(sessionId)
+    : undefined;
+  queuedInputIntents =
+    sessionId && retainedIntents
+      ? new Map([[sessionId, retainedIntents]])
+      : new Map();
+  const retainedSeenKeys = sessionId
+    ? seenContextUserMessageKeys.get(sessionId)
+    : undefined;
+  seenContextUserMessageKeys =
+    sessionId && retainedSeenKeys
+      ? new Map([[sessionId, retainedSeenKeys]])
+      : new Map();
+}
+
+export function queueInputIntent(
+  sessionId: string,
+  text: string,
+  mode: StreamingBehavior,
+): string {
+  const queue = queuedInputIntents.get(sessionId) ?? [];
+  const id = crypto.randomUUID();
+  queue.push({ id, text, mode, createdAt: Date.now() });
+  if (queue.length > 100) {
+    queue.splice(0, queue.length - 100);
+  }
+  queuedInputIntents.set(sessionId, queue);
+  return id;
+}
+
+export function consumeInputIntentForText(
+  sessionId: string,
+  text: string,
+): StreamingBehavior | undefined {
+  const queue = queuedInputIntents.get(sessionId);
+  if (!queue || queue.length === 0) {
+    return undefined;
+  }
+  const exactIdx = queue.findIndex((intent) => intent.text === text);
+  const idx = exactIdx >= 0 ? exactIdx : 0;
+  const [intent] = queue.splice(idx, 1);
+  if (queue.length === 0) {
+    queuedInputIntents.delete(sessionId);
+  } else {
+    queuedInputIntents.set(sessionId, queue);
+  }
+  return intent?.mode;
+}
+
+export function markSeenContextUserMessageKey(
+  sessionId: string,
+  key: string,
+): void {
+  const seen = seenContextUserMessageKeys.get(sessionId) ?? new Set<string>();
+  seen.add(key);
+  seenContextUserMessageKeys.set(sessionId, seen);
+}
+
+export function hasSeenContextUserMessageKey(
+  sessionId: string,
+  key: string,
+): boolean {
+  return seenContextUserMessageKeys.get(sessionId)?.has(key) ?? false;
 }

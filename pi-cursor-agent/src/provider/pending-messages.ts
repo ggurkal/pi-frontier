@@ -7,6 +7,7 @@ import {
   UserMessage,
   UserMessageAction,
 } from "../__generated__/agent/v1/agent_pb";
+import type { StreamingBehavior } from "./agent-stream-hook";
 
 /**
  * Drain mode for {@link PendingMessageQueue}.
@@ -118,6 +119,11 @@ export interface MessageDispatcher {
    * `steer` / `followUp` calls.
    */
   close(): void;
+  /**
+   * Mark a previously sent user message as acknowledged by the server.
+   * Used to avoid replaying already-applied steer messages on reconnect.
+   */
+  ackUserMessage(messageId: string): void;
   /** Total messages waiting across both queues. Useful for observability. */
   pendingCount(): number;
 }
@@ -194,6 +200,7 @@ export function createMessageDispatcher(
 
   const steeringQueue = new PendingMessageQueue(mode);
   const followUpQueue = new PendingMessageQueue(mode);
+  const inflightSteering = new Map<string, string>();
 
   let stream: WritableIterable<AgentClientMessage> | undefined;
   let closed = false;
@@ -204,7 +211,10 @@ export function createMessageDispatcher(
     }
   };
 
-  const flushQueue = async (queue: PendingMessageQueue): Promise<void> => {
+  const flushQueue = async (
+    queue: PendingMessageQueue,
+    kind: StreamingBehavior,
+  ): Promise<void> => {
     if (!stream) return;
     while (queue.hasItems() && !closed && stream) {
       const batch = queue.drain();
@@ -218,7 +228,13 @@ export function createMessageDispatcher(
           return;
         }
         try {
-          await stream.write(buildUserMessageAction(text, generateMessageId()));
+          const messageId = generateMessageId();
+          await stream.write(buildUserMessageAction(text, messageId));
+          if (kind === "steer") {
+            // Consider steer delivery optimistic until user-message-appended
+            // arrives from interaction updates.
+            inflightSteering.set(messageId, text);
+          }
         } catch {
           // Write failed (e.g. transport dropped). Requeue this and remaining
           // items in original order; they'll be retried on next bind().
@@ -243,25 +259,36 @@ export function createMessageDispatcher(
           // will still be redelivered on the next bind().
         }
       }
-      await flushQueue(steeringQueue);
+      await flushQueue(steeringQueue, "steer");
     },
 
     async followUp(text: string): Promise<void> {
       ensureUsable();
       followUpQueue.enqueue(text);
-      await flushQueue(followUpQueue);
+      await flushQueue(followUpQueue, "followUp");
     },
 
     async bind(newStream: WritableIterable<AgentClientMessage>): Promise<void> {
       ensureUsable();
+      const replacingStream = Boolean(stream && stream !== newStream);
+      if (replacingStream && inflightSteering.size > 0) {
+        // Connection was replaced before we saw user-message-appended ACKs.
+        // Replay optimistic steers in original send order.
+        steeringQueue.prepend([...inflightSteering.values()]);
+        inflightSteering.clear();
+      }
       stream = newStream;
       // Redeliver anything that piled up while we were disconnected.
       // Steering retries are sent as plain user messages (see interface docs).
-      await flushQueue(steeringQueue);
-      await flushQueue(followUpQueue);
+      await flushQueue(steeringQueue, "steer");
+      await flushQueue(followUpQueue, "followUp");
     },
 
     unbind(): void {
+      if (inflightSteering.size > 0) {
+        steeringQueue.prepend([...inflightSteering.values()]);
+        inflightSteering.clear();
+      }
       stream = undefined;
     },
 
@@ -270,6 +297,11 @@ export function createMessageDispatcher(
       stream = undefined;
       steeringQueue.clear();
       followUpQueue.clear();
+      inflightSteering.clear();
+    },
+
+    ackUserMessage(messageId: string): void {
+      inflightSteering.delete(messageId);
     },
 
     pendingCount(): number {

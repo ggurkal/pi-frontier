@@ -18,6 +18,12 @@ import {
 } from "./lib/env";
 import { restoreAgentStoreFromBranch } from "./provider/agent-store";
 import {
+  getLiveSession,
+  queueInputIntent,
+  toStreamingBehavior,
+} from "./provider/agent-stream-hook";
+import { routeStreamingInputToLiveSession } from "./provider/input-routing";
+import {
   getCachedPiModels,
   updateCachedPiModelsIfStale,
 } from "./provider/models";
@@ -129,6 +135,42 @@ export default (pi: ExtensionAPI) => {
 
   pi.on("session_tree", async (_, ctx) => {
     await refreshBranchState(ctx);
+  });
+
+  pi.on("input", async (event, ctx) => {
+    const sessionId = ctx.sessionManager.getSessionId();
+    const liveSession = getLiveSession(sessionId);
+    const source = (event as { source?: unknown }).source;
+    const streamingBehavior = toStreamingBehavior(
+      (event as { streamingBehavior?: unknown; deliverAs?: unknown })
+        .streamingBehavior ??
+        (event as { streamingBehavior?: unknown; deliverAs?: unknown })
+          .deliverAs,
+    );
+    const text = (event as { text?: unknown }).text;
+    if (
+      source === "interactive" &&
+      streamingBehavior &&
+      typeof text === "string" &&
+      text.trim().length > 0
+    ) {
+      if (liveSession) {
+        try {
+          if (streamingBehavior === "steer") {
+            liveSession.markSteerIntent?.();
+            await liveSession.steer(text);
+          } else {
+            await liveSession.followUp(text);
+          }
+        } catch {
+          queueInputIntent(sessionId, text, streamingBehavior);
+        }
+      } else {
+        queueInputIntent(sessionId, text, streamingBehavior);
+      }
+    }
+    const action = await routeStreamingInputToLiveSession(event, liveSession);
+    return { action };
   });
 
   pi.on("tool_execution_end", async (event) => {
