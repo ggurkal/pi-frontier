@@ -13,8 +13,12 @@ import {
   retainOnlyAgentStore,
 } from "../../src/lib/agent-store/index.js";
 import {
+  consumeInputIntentForText,
   getLiveSession,
+  hasSeenContextUserMessageKey,
   LiveEventChannel,
+  markSeenContextUserMessageKey,
+  queueInputIntent,
   retainOnlyLiveSession,
   setLiveSession,
 } from "../../src/provider/agent-stream-hook.js";
@@ -38,14 +42,24 @@ function createLiveSession(label: string) {
 test("retainOnlyLiveSession keeps only the selected live session", () => {
   setLiveSession("session-a", createLiveSession("session-a"));
   setLiveSession("session-b", createLiveSession("session-b"));
+  queueInputIntent("session-a", "steer a", "steer");
+  queueInputIntent("session-b", "steer b", "steer");
+  markSeenContextUserMessageKey("session-a", "a:key");
+  markSeenContextUserMessageKey("session-b", "b:key");
 
   retainOnlyLiveSession("session-a");
 
   assert.ok(getLiveSession("session-a"));
   assert.equal(getLiveSession("session-b"), undefined);
+  assert.equal(consumeInputIntentForText("session-a", "steer a"), "steer");
+  assert.equal(consumeInputIntentForText("session-b", "steer b"), undefined);
+  assert.equal(hasSeenContextUserMessageKey("session-a", "a:key"), true);
+  assert.equal(hasSeenContextUserMessageKey("session-b", "b:key"), false);
 
   retainOnlyLiveSession(null);
   assert.equal(getLiveSession("session-a"), undefined);
+  assert.equal(consumeInputIntentForText("session-a", "steer a"), undefined);
+  assert.equal(hasSeenContextUserMessageKey("session-a", "a:key"), false);
 });
 
 test("retainOnlyAgentStore keeps only the selected in-memory store", async () => {

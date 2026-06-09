@@ -230,6 +230,10 @@ test("reconnect: bind() with a new stream redelivers pending messages", async ()
     "cancelAction",
     "userMessageAction",
   ]);
+  const firstSteerId = ids(a.written)[0];
+  if (firstSteerId) {
+    dispatcher.ackUserMessage(firstSteerId);
+  }
 
   // Simulate disconnect: unbind, then user steers again while down.
   dispatcher.unbind();
@@ -253,6 +257,46 @@ test("reconnect: bind() with a new stream redelivers pending messages", async ()
     "queued-followup",
   ]);
   assert.equal(dispatcher.pendingCount(), 0);
+});
+
+test("reconnect replays unacked steer messages", async () => {
+  const dispatcher = createMessageDispatcher({
+    generateMessageId: makeIdGen(),
+  });
+
+  const a = createMockStream();
+  await dispatcher.bind(a.stream);
+  await dispatcher.steer("replay-me");
+  assert.deepEqual(actionCases(a.written), [
+    "cancelAction",
+    "userMessageAction",
+  ]);
+
+  // Rebinding without ACK should replay the optimistic steer.
+  const b = createMockStream();
+  await dispatcher.bind(b.stream);
+
+  assert.deepEqual(actionCases(b.written), ["userMessageAction"]);
+  assert.equal(userText(b.written[0]), "replay-me");
+});
+
+test("reconnect does not replay acked steer messages", async () => {
+  const dispatcher = createMessageDispatcher({
+    generateMessageId: makeIdGen(),
+  });
+
+  const a = createMockStream();
+  await dispatcher.bind(a.stream);
+  await dispatcher.steer("already-applied");
+  const sentIds = ids(a.written);
+  if (sentIds[0]) {
+    dispatcher.ackUserMessage(sentIds[0]);
+  }
+
+  const b = createMockStream();
+  await dispatcher.bind(b.stream);
+
+  assert.equal(b.written.length, 0);
 });
 
 test("multiple reconnects flush only what is still queued", async () => {
