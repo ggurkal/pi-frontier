@@ -148,7 +148,9 @@ test("isDangerousShellCommand allows rm with only force flag", () => {
 
 test("isDangerousShellCommand allows curl and bash without a pipe", () => {
   assert.equal(
-    isDangerousShellCommand("curl https://example.com/install.sh && bash setup.sh"),
+    isDangerousShellCommand(
+      "curl https://example.com/install.sh && bash setup.sh",
+    ),
     false,
   );
 });
