@@ -16,6 +16,14 @@ import {
   CURSOR_CLIENT_VERSION,
   CURSOR_WEBSITE_URL,
 } from "./lib/env";
+import {
+  getSkipApprovalEnabled,
+  parseSkipApprovalArgs,
+  resolveSkipApprovalEnabled,
+  SKIP_APPROVAL_OPTIONS,
+  setSkipApprovalEnabled,
+  updateSkipApprovalStatus,
+} from "./lib/skip-approval";
 import { restoreAgentStoreFromBranch } from "./provider/agent-store";
 import {
   getLiveSession,
@@ -108,6 +116,44 @@ export default (pi: ExtensionAPI) => {
     retainOnlyActiveSessionMemory(sessionId);
   };
 
+  const applySkipApproval = (enabled: boolean, ctx: ExtensionContext) => {
+    setSkipApprovalEnabled(enabled);
+    updateSkipApprovalStatus(ctx);
+  };
+
+  pi.registerFlag("skip-approval", {
+    description: "Skip Cursor dangerous command approval prompts",
+    type: "boolean",
+    default: false,
+  });
+
+  pi.registerCommand("skip-approval", {
+    description: "Toggle skipping Cursor dangerous command approvals",
+    getArgumentCompletions: (prefix) => {
+      const filtered = SKIP_APPROVAL_OPTIONS.filter((option) =>
+        option.startsWith(prefix),
+      );
+      return filtered.map((value) => ({ value, label: value }));
+    },
+    handler: async (args, ctx) => {
+      const action = parseSkipApprovalArgs(args ?? "");
+      if (action === undefined) {
+        if (ctx.hasUI) {
+          ctx.ui.notify("Usage: /skip-approval [on|off]", "error");
+        }
+        return;
+      }
+      applySkipApproval(resolveSkipApprovalEnabled(action), ctx);
+    },
+  });
+
+  pi.registerShortcut("ctrl+shift+y", {
+    description: "Toggle skip-approval",
+    handler: async (ctx) => {
+      applySkipApproval(!getSkipApprovalEnabled(), ctx);
+    },
+  });
+
   pi.on("before_agent_start", async (_, ctx) => {
     lastCtx = ctx;
   });
@@ -125,16 +171,22 @@ export default (pi: ExtensionAPI) => {
 
   pi.on("session_start", async (_, ctx) => {
     await refreshBranchState(ctx);
+    if (pi.getFlag("skip-approval") === true) {
+      setSkipApprovalEnabled(true);
+    }
+    updateSkipApprovalStatus(ctx);
     updateCachedModelsFromContextInBackground(ctx);
   });
 
   pi.on("session_switch", async (_, ctx) => {
     await refreshBranchState(ctx);
+    updateSkipApprovalStatus(ctx);
     updateCachedModelsFromContextInBackground(ctx);
   });
 
   pi.on("session_tree", async (_, ctx) => {
     await refreshBranchState(ctx);
+    updateSkipApprovalStatus(ctx);
   });
 
   pi.on("input", async (event, ctx) => {

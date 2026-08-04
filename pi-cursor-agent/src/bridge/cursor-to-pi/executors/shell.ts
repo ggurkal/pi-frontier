@@ -10,6 +10,7 @@ import {
   ShellResult as ShellResultClass,
   ShellSuccess,
 } from "../../../__generated__/agent/v1/shell_exec_pb";
+import { getSkipApprovalEnabled } from "../../../lib/skip-approval";
 import type { Executor } from "../../../vendor/agent-exec";
 import { toolResultToText } from "../../shared/tool-result";
 import {
@@ -506,6 +507,7 @@ export async function confirmIfDangerous(
   command: string,
 ): Promise<boolean> {
   if (!isDangerousShellCommand(command)) return true;
+  if (getSkipApprovalEnabled()) return true;
   const ctx = getCtx();
   if (!ctx?.hasUI) return false;
   return ctx.ui.confirm("Cursor command approval", command);
