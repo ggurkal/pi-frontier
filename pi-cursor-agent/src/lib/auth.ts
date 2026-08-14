@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import type { OAuthLoginCallbacks } from "@mariozechner/pi-ai";
+import type { OAuthLoginCallbacks } from "@earendil-works/pi-ai";
 import type Auth from "../api/auth";
 import { backoff } from "./backoff";
 
@@ -34,10 +34,13 @@ class AuthManager {
     });
   }
 
-  public async refresh(credentials: {
-    access: string;
-    refresh: string;
-  }): Promise<{ access: string; refresh: string; expires: number }> {
+  public async refresh(
+    credentials: {
+      access: string;
+      refresh: string;
+    },
+    signal?: AbortSignal,
+  ): Promise<{ access: string; refresh: string; expires: number }> {
     if (!credentials.access && !credentials.refresh) {
       throw new Error("No credentials provided");
     }
@@ -45,13 +48,17 @@ class AuthManager {
     try {
       const { accessToken, refreshToken } = await this.auth.exchangeUserApiKey({
         token: credentials.refresh || credentials.access,
+        signal,
       });
       const expires = getTokenExpiry(accessToken);
       return { access: accessToken, refresh: refreshToken, expires };
     } catch {
       // If the refresh token is invalid, try to refresh it with access token
       if (credentials.access && credentials.refresh) {
-        return this.refresh({ access: credentials.access, refresh: "" });
+        return this.refresh(
+          { access: credentials.access, refresh: "" },
+          signal,
+        );
       }
       throw new Error("Failed to refresh credentials");
     }

@@ -1,4 +1,4 @@
-import type { ThinkingLevel } from "@mariozechner/pi-ai";
+import type { ThinkingLevel } from "@earendil-works/pi-ai";
 
 /**
  * Mapping from canonical model IDs to Cursor model IDs.

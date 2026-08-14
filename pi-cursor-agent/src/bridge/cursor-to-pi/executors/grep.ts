@@ -2,7 +2,7 @@ import { constants as fsConstants } from "node:fs";
 import { access } from "node:fs/promises";
 import { homedir } from "node:os";
 import nodePath from "node:path";
-import type { ToolResultMessage } from "@mariozechner/pi-ai";
+import type { ToolResultMessage } from "@earendil-works/pi-ai";
 import type {
   GrepArgs,
   GrepResult,

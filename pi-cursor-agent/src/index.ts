@@ -2,11 +2,11 @@ import type {
   Api,
   OAuthCredentials,
   OAuthLoginCallbacks,
-} from "@mariozechner/pi-ai";
+} from "@earendil-works/pi-ai";
 import type {
   ExtensionAPI,
   ExtensionContext,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 import AiService from "./api/ai-service";
 import Auth from "./api/auth";
 import { resolveToolResult } from "./bridge/cursor-to-pi/tool-bridge";
@@ -79,8 +79,9 @@ const login = async (
 
 const refreshToken = async (
   credentials: OAuthCredentials,
+  signal: AbortSignal,
 ): Promise<OAuthCredentials> => {
-  const refreshed = await auth.refresh(credentials);
+  const refreshed = await auth.refresh(credentials, signal);
   updateCachedModelsInBackground(refreshed.access);
   return refreshed;
 };
@@ -178,10 +179,13 @@ export default (pi: ExtensionAPI) => {
     updateCachedModelsFromContextInBackground(ctx);
   });
 
-  pi.on("session_switch", async (_, ctx) => {
-    await refreshBranchState(ctx);
-    updateSkipApprovalStatus(ctx);
-    updateCachedModelsFromContextInBackground(ctx);
+  pi.on("session_shutdown", async () => {
+    const sessionId = currentSessionId;
+    currentSessionId = null;
+    lastCtx = null;
+    if (sessionId) {
+      await terminateSession(sessionId, "Session ended");
+    }
   });
 
   pi.on("session_tree", async (_, ctx) => {

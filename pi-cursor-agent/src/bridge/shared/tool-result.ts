@@ -2,7 +2,7 @@ import type {
   ImageContent,
   TextContent,
   ToolResultMessage,
-} from "@mariozechner/pi-ai";
+} from "@earendil-works/pi-ai";
 
 export function toolResultToText(result: ToolResultMessage): string {
   return result.content

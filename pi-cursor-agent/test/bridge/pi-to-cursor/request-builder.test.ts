@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { Context, Message, Model } from "@mariozechner/pi-ai";
+import type { Context, Message, Model } from "@earendil-works/pi-ai";
 import { ConversationStateStructure } from "../../../src/__generated__/agent/v1/agent_pb.js";
 import { buildRunRequest } from "../../../src/bridge/pi-to-cursor/request-builder.js";
 import { createStateStore } from "../../../src/provider/state.js";

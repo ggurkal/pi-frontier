@@ -1,4 +1,4 @@
-import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 
 const TOOL_CALL_META_ENTRY_TYPE = "pi-cursor-agent:tool-call-meta";
 const ASSISTANT_CONTENT_ENTRY_TYPE = "pi-cursor-agent:assistant-content";

@@ -1,5 +1,5 @@
 import { Value } from "@bufbuild/protobuf";
-import type { ToolResultMessage } from "@mariozechner/pi-ai";
+import type { ToolResultMessage } from "@earendil-works/pi-ai";
 import type {
   McpArgs,
   McpResult,

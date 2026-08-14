@@ -5,7 +5,7 @@
 
 ![terminal](./assets/terminal.avif)
 
-Cursor Agent provider extension for [pi](https://github.com/badlogic/pi-mono).
+Cursor Agent provider extension for [pi](https://github.com/earendil-works/pi).
 
 Use [Cursor](https://cursor.com/)'s AI models directly from pi with your existing Cursor subscription. Supports Claude, GPT, Gemini, Grok, Composer, and Kimi models — including thinking/reasoning variants.
 
@@ -62,7 +62,7 @@ pi install npm:pi-cursor-agent
 
 ## Requirements
 
-- `pi >= 0.52.10`
+- `pi >= 0.84.0`
 - Cursor subscription
 
 ## License

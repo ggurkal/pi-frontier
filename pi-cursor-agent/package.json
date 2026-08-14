@@ -45,13 +45,15 @@
     "@bufbuild/buf": "^1.65.0",
     "@bufbuild/protoc-gen-es": "1.10.0",
     "@connectrpc/protoc-gen-connect-es": "^1.7.0",
+    "@earendil-works/pi-ai": "^0.84.2",
+    "@earendil-works/pi-coding-agent": "^0.84.2",
     "@tsconfig/strictest": "^2.0.8",
     "@types/node": "^24.10.10",
     "tsx": "^4.20.6",
     "typescript": "^5.9.3"
   },
   "peerDependencies": {
-    "@mariozechner/pi-ai": ">=0.52.10",
-    "@mariozechner/pi-coding-agent": ">=0.52.10"
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
   }
 }

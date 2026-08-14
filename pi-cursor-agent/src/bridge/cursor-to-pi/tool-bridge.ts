@@ -1,4 +1,4 @@
-import type { ToolResultMessage } from "@mariozechner/pi-ai";
+import type { ToolResultMessage } from "@earendil-works/pi-ai";
 import type { LiveEventChannel } from "../../provider/agent-stream-hook";
 
 export function shellQuote(value: string): string {

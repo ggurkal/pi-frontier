@@ -8,7 +8,7 @@ import type {
   TextContent,
   Tool,
   ToolResultMessage,
-} from "@mariozechner/pi-ai";
+} from "@earendil-works/pi-ai";
 import {
   AgentClientMessage,
   AgentConversationTurnStructure,

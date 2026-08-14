@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import type { ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { confirmIfDangerous } from "../../../src/bridge/cursor-to-pi/executors/shell.js";
 import { setSkipApprovalEnabled } from "../../../src/lib/skip-approval.js";
 

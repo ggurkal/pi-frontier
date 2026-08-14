@@ -1,5 +1,5 @@
 import fs from "node:fs";
-import type { Api, Model } from "@mariozechner/pi-ai";
+import type { Api, Model } from "@earendil-works/pi-ai";
 import type { ModelDetails } from "../__generated__/agent/v1/agent_pb";
 import type AiService from "../api/ai-service";
 import { CURSOR_API_URL } from "../lib/env";

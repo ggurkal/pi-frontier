@@ -9,11 +9,11 @@ import {
   type SimpleStreamOptions,
   type TextContent,
   type ThinkingContent,
-} from "@mariozechner/pi-ai";
+} from "@earendil-works/pi-ai";
 import type {
   ExtensionAPI,
   ExtensionContext,
-} from "@mariozechner/pi-coding-agent";
+} from "@earendil-works/pi-coding-agent";
 import type { ConversationStateStructure } from "../__generated__/agent/v1/agent_pb";
 import {
   AskQuestionRejected,
