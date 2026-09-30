@@ -25,7 +25,7 @@ import {
   type PiToolContext,
 } from "../bridge/cursor-to-pi/local-resource-provider";
 import {
-  rejectPendingForSession,
+  rejectPendingForChannel,
   type ToolExecRequest,
 } from "../bridge/cursor-to-pi/tool-bridge";
 import { preparePiContext } from "../bridge/pi-context";
@@ -39,6 +39,10 @@ import {
   type CheckpointHandler,
   type InteractionListener,
 } from "../vendor/agent-client";
+import {
+  type AgentRpcClient,
+  ORIGINAL_REQUEST_ID_HEADER,
+} from "../vendor/agent-client/connect";
 import type {
   CoreInteractionQuery,
   CoreInteractionResponse,
@@ -53,18 +57,20 @@ import {
 import {
   type ChannelEvent,
   type ContentEvent,
-  consumeInputIntentForText,
   deleteLiveSession,
   getLiveSession,
-  hasSeenContextUserMessageKey,
   LiveEventChannel,
   type LiveSession,
-  markSeenContextUserMessageKey,
-  queueInputIntent,
   setLiveSession,
 } from "./agent-stream-hook";
 import { toCursorId } from "./model-mapping";
-import { createMessageDispatcher } from "./pending-messages";
+import { createSteerDispatcher } from "./pending-messages";
+import {
+  awaitSessionTeardown,
+  beginSessionStartup,
+  runSessionTeardown,
+  terminateSession,
+} from "./session-lifecycle";
 import { type CursorStateStore, createOverlayState } from "./state";
 
 function createCheckpointHandler(
@@ -87,7 +93,6 @@ const REQUEST_CANCELLED_MESSAGE = "Request cancelled";
 const SESSION_ENDED_MESSAGE = "Session ended";
 const REQUEST_ABORTED_MESSAGE = "Request aborted";
 const USER_ABORTED_REQUEST_MESSAGE = "User aborted request";
-const STEER_ABORT_GRACE_WINDOW_MS = 2_000;
 const CURSOR_ABORT_BRACKET_PATTERN =
   /\[(?:canceled|aborted)\].*\[(?:canceled|aborted)\]/i;
 
@@ -436,59 +441,373 @@ function extractUserMessageText(
   return text.length > 0 ? text : null;
 }
 
-function buildContextUserMessageKey(
-  message: Context["messages"][number],
-  text: string,
-): string {
-  return `${message.timestamp}:${text}`;
+/**
+ * Stable keys for the context's user messages. Equal timestamp and text get
+ * an occurrence number, so repeated messages stay distinct.
+ */
+function contextUserMessageKeys(
+  context: Context,
+): Array<{ index: number; key: string; text: string }> {
+  const occurrences = new Map<string, number>();
+  const keys: Array<{ index: number; key: string; text: string }> = [];
+  context.messages.forEach((message, index) => {
+    const text = extractUserMessageText(message);
+    if (!text) return;
+    const base = `${message.timestamp}:${text}`;
+    const occurrence = occurrences.get(base) ?? 0;
+    occurrences.set(base, occurrence + 1);
+    keys.push({ index, key: `${base}#${occurrence}`, text });
+  });
+  return keys;
 }
 
-function markContextUserMessagesSeen(
-  sessionId: string,
+/**
+ * Inject the user messages Pi added since the run's last assistant message,
+ * such as steers delivered after a tool batch.
+ */
+function adoptNewUserMessages(session: LiveSession, context: Context): void {
+  let start = context.messages.length;
+  while (start > 0 && context.messages[start - 1]?.role !== "assistant") {
+    start--;
+  }
+  for (const { index, key, text } of contextUserMessageKeys(context)) {
+    if (index < start || session.seenUserMessageKeys.has(key)) continue;
+    session.seenUserMessageKeys.add(key);
+    // Not awaited: a stalled write must not keep the stream from seeing an
+    // abort.
+    void session.steers.adopt(text);
+  }
+}
+
+/** Updates that add to the conversation, making earlier checkpoints stale. */
+const OUTPUT_UPDATE_TYPES = new Set<CoreInteractionUpdate["type"]>([
+  "text-delta",
+  "thinking-delta",
+  "thinking-completed",
+  "partial-tool-call",
+  "tool-call-started",
+  "tool-call-delta",
+  "tool-call-completed",
+  "user-message-appended",
+]);
+
+/**
+ * History for a run that sends `owed` steers when no checkpoint covers the
+ * finished run: the owed messages move to the action and the finished run's
+ * output is appended.
+ */
+function contextForOwedRun(
   context: Context,
+  output: CursorAssistantMessage,
+  owed: string[],
+): Context {
+  const remaining = [...owed];
+  const messages = [...context.messages];
+  for (let i = messages.length - 1; i >= 0 && remaining.length > 0; i--) {
+    const message = messages[i];
+    const text = message ? extractUserMessageText(message) : null;
+    const at = text === null ? -1 : remaining.lastIndexOf(text);
+    if (at === -1) continue;
+    remaining.splice(at, 1);
+    messages.splice(i, 1);
+  }
+  messages.push({
+    ...output,
+    content: [...output.content],
+    stopReason: "stop",
+  });
+  return { ...context, messages };
+}
+
+/** Rejects with `Request aborted` once `signal` aborts. */
+async function unlessAborted<T>(
+  promise: Promise<T>,
+  signal: AbortSignal | undefined,
+): Promise<T> {
+  if (!signal) return promise;
+  if (signal.aborted) throw new Error(REQUEST_ABORTED_MESSAGE);
+  let onAbort: (() => void) | undefined;
+  const aborted = new Promise<never>((_, reject) => {
+    onAbort = () => reject(new Error(REQUEST_ABORTED_MESSAGE));
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    return await Promise.race([promise, aborted]);
+  } finally {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
+}
+
+type AgentRpcClientFactory = (
+  baseUrl: string,
+  accessToken: string,
+) => AgentRpcClient;
+
+const defaultAgentRpcClientFactory: AgentRpcClientFactory = (
+  baseUrl,
+  accessToken,
+) =>
+  new AgentService(baseUrl, {
+    accessToken,
+    clientVersion: CURSOR_CLIENT_VERSION,
+    clientType: "cli",
+  }).rpcClient;
+
+let createAgentRpcClient = defaultAgentRpcClientFactory;
+
+/** Test seam: replace the Cursor transport. Pass `undefined` to restore. */
+export function setAgentRpcClientFactory(
+  factory: AgentRpcClientFactory | undefined,
 ): void {
-  for (const message of context.messages) {
-    const text = extractUserMessageText(message);
-    if (!text) continue;
-    markSeenContextUserMessageKey(
-      sessionId,
-      buildContextUserMessageKey(message, text),
+  createAgentRpcClient = factory ?? defaultAgentRpcClientFactory;
+}
+
+interface StartLiveSessionParams {
+  pi: ExtensionAPI;
+  getCtx: () => ExtensionContext | null;
+  state: CursorStateStore;
+  model: Model<Api>;
+  context: Context;
+  options: SimpleStreamOptions | undefined;
+  sessionId: string;
+}
+
+interface RunOverrides {
+  /** The run action; see `buildRunRequest`. */
+  userText?: string;
+  /** Rebuild history from the Pi context instead of the cached checkpoint. */
+  ignoreCachedState?: boolean;
+  /**
+   * The finished session this run takes over from. The run is not started if
+   * that session was terminated meanwhile.
+   */
+  replaces?: LiveSession;
+}
+
+async function startLiveSession(
+  params: StartLiveSessionParams,
+  overrides: RunOverrides = {},
+): Promise<LiveSession> {
+  const startup = beginSessionStartup(params.sessionId);
+  try {
+    return await startRun(params, overrides, startup.stillWanted);
+  } finally {
+    startup.end();
+  }
+}
+
+async function startRun(
+  params: StartLiveSessionParams,
+  overrides: RunOverrides,
+  stillWanted: () => boolean,
+): Promise<LiveSession> {
+  const { userText, ignoreCachedState, replaces } = overrides;
+  const { pi, getCtx, state, model, context, options, sessionId } = params;
+  const apiKey = options?.apiKey;
+  if (!apiKey) {
+    throw new Error(
+      "Cursor API key (access token) is required. Run /login cursor or set CURSOR_ACCESS_TOKEN.",
     );
   }
-}
 
-async function bridgeQueuedInteractiveInputs(
-  sessionId: string,
-  context: Context,
-  liveSession: LiveSession,
-): Promise<void> {
-  for (const message of context.messages) {
-    const text = extractUserMessageText(message);
-    if (!text) {
-      continue;
-    }
-    const key = buildContextUserMessageKey(message, text);
-    if (hasSeenContextUserMessageKey(sessionId, key)) {
-      continue;
-    }
-    const mode = consumeInputIntentForText(sessionId, text);
-    if (!mode) {
-      markSeenContextUserMessageKey(sessionId, key);
-      continue;
-    }
-    try {
-      if (mode === "followUp") {
-        await liveSession.followUp(text);
-      } else {
-        liveSession.markSteerIntent?.();
-        await liveSession.steer(text);
-      }
-      markSeenContextUserMessageKey(sessionId, key);
-    } catch {
-      // Preserve intent for retry on the next stream invocation.
-      queueInputIntent(sessionId, text, mode);
-    }
+  const signal = options?.signal;
+  await unlessAborted(awaitSessionTeardown(sessionId), signal);
+  const agentStore = await unlessAborted(ensureAgentStore(sessionId), signal);
+  const cwd = getCtx()?.cwd ?? process.cwd();
+  const requestContextTools = getContextTools(context);
+
+  const channel = new LiveEventChannel(sessionId);
+  const sessionAbortController = new AbortController();
+  const sessionSignal = sessionAbortController.signal;
+
+  const piToolCtx: PiToolContext = {
+    cwd,
+    signal: sessionSignal,
+    getActiveTools: () => new Set(pi.getActiveTools()),
+    getCtx,
+    getChannel: () => channel,
+  };
+
+  const piContext = await unlessAborted(
+    preparePiContext(context.systemPrompt ?? ""),
+    signal,
+  );
+
+  // Last await before the run starts and registers: from here on nothing can
+  // interleave, so a cancel either happened already or reaches the new run.
+  if (
+    signal?.aborted ||
+    !stillWanted() ||
+    (replaces && getLiveSession(sessionId) !== replaces)
+  ) {
+    throw new Error(REQUEST_ABORTED_MESSAGE);
   }
+
+  const resources = new LocalResourceProvider({
+    ctx: piToolCtx,
+    requestContextTools,
+    cursorRules: piContext.rules,
+  });
+
+  const blobStore = agentStore.getBlobStore();
+  const cursorModelId = toCursorId(model.id, options?.reasoning);
+  const overlayState = createOverlayState(state);
+  const { initialRequest, conversationState } = buildRunRequest({
+    model: { ...model, id: cursorModelId },
+    context,
+    conversationId: agentStore.getId(),
+    blobStore,
+    conversationState: ignoreCachedState
+      ? undefined
+      : agentStore.getConversationStateStructure(),
+    mcpToolDefinitions: requestContextTools,
+    state: overlayState,
+    systemPromptOverride: piContext.cleanedPrompt,
+    ...(userText !== undefined ? { userText } : {}),
+  });
+  agentStore.conversationStateStructure = conversationState;
+
+  let lastFlushedRootBlobId: string | undefined;
+  const flushSessionState = async (isCurrent: () => boolean = () => true) => {
+    const snapshot = await persistAgentStore(sessionId, isCurrent);
+    if (
+      !snapshot ||
+      !isCurrent() ||
+      snapshot.latestRootBlobId === lastFlushedRootBlobId
+    )
+      return;
+    lastFlushedRootBlobId = snapshot.latestRootBlobId;
+    pi.appendEntry(CURSOR_STATE_ENTRY_TYPE, snapshot);
+  };
+
+  const runId = crypto.randomUUID();
+  const steers = createSteerDispatcher({ runId });
+  let checkpointCurrent = false;
+
+  const handleInteractionUpdate = (update: CoreInteractionUpdate) => {
+    if (OUTPUT_UPDATE_TYPES.has(update.type)) checkpointCurrent = false;
+    switch (update.type) {
+      case "text-delta":
+        channel.push({
+          kind: "content",
+          data: { kind: "text-delta", text: update.text },
+        });
+        return;
+      case "thinking-delta":
+        channel.push({
+          kind: "content",
+          data: { kind: "thinking-delta", text: update.text },
+        });
+        return;
+      case "thinking-completed":
+        channel.push({
+          kind: "content",
+          data: { kind: "thinking-completed", text: "" },
+        });
+        return;
+      case "token-delta":
+        channel.push({ kind: "token-delta", tokens: update.tokens });
+        return;
+      case "context-injection-state":
+        if (update.state === "delivered") checkpointCurrent = false;
+        steers.applyAck(update.injectionId, update.state);
+        return;
+      default:
+        return;
+    }
+  };
+
+  const connectClient = new AgentConnectClient(
+    createAgentRpcClient(model.baseUrl || CURSOR_API_URL, apiKey),
+  );
+  const interactionListener = createInteractionListenerAdapter(
+    handleInteractionUpdate,
+  );
+  const checkpointHandler = createCheckpointHandler(
+    (checkpoint: ConversationStateStructure) => {
+      checkpointCurrent = true;
+      steers.commit();
+      void agentStore.handleCheckpoint(null, checkpoint);
+    },
+  );
+  checkpointHandler.getLatestCheckpoint = () =>
+    agentStore.getConversationStateStructure();
+
+  const runOptions: Parameters<typeof connectClient.run>[1] = {
+    interactionListener,
+    resources,
+    blobStore,
+    checkpointHandler,
+    signal: sessionSignal,
+    headers: {
+      "x-request-id": runId,
+      [ORIGINAL_REQUEST_ID_HEADER]: runId,
+    },
+    onRequestStreamCreated: (stream) => {
+      // Rebinds on every (re)connect. Errors here would otherwise propagate
+      // into connect.ts and abort the run.
+      void steers.bind(stream).catch(() => {});
+    },
+  };
+
+  const linkedSignals = new Map<AbortSignal, () => void>();
+  const unlinkSignals = () => {
+    for (const [signal, onAbort] of linkedSignals) {
+      signal.removeEventListener("abort", onAbort);
+    }
+    linkedSignals.clear();
+  };
+
+  const cursorRunPromise = connectClient
+    .run(initialRequest, runOptions)
+    .then(() => channel.push({ kind: "cursor-done" }))
+    .catch((error) => channel.push({ kind: "cursor-error", error }))
+    .finally(() => {
+      unlinkSignals();
+      steers.close();
+      channel.markDone();
+    });
+
+  const session: LiveSession = {
+    channel,
+    cursorRunPromise,
+    flushSessionState,
+    abort: (reason = "Session ended") => {
+      steers.close();
+      // The run cannot finish while an exec waits on a tool request.
+      channel.markDone();
+      rejectPendingForChannel(channel, reason);
+      sessionAbortController.abort(new Error(reason));
+    },
+    startTime: Date.now(),
+    steers,
+    seenUserMessageKeys: new Set(
+      contextUserMessageKeys(context).map(({ key }) => key),
+    ),
+    hasCurrentCheckpoint: () => checkpointCurrent,
+    markCheckpointStale: () => {
+      checkpointCurrent = false;
+    },
+    linkAbort: (signal) => {
+      if (!signal || linkedSignals.has(signal) || channel.isDone) return;
+      const onAbort = () => {
+        if (getLiveSession(sessionId) === session) {
+          void terminateSession(sessionId, REQUEST_ABORTED_MESSAGE);
+        } else {
+          session.abort(REQUEST_ABORTED_MESSAGE);
+        }
+      };
+      if (signal.aborted) {
+        onAbort();
+        return;
+      }
+      linkedSignals.set(signal, onAbort);
+      signal.addEventListener("abort", onAbort, { once: true });
+    },
+  };
+  setLiveSession(sessionId, session);
+  session.linkAbort(options?.signal);
+  return session;
 }
 
 export function streamCursorAgent(
@@ -521,208 +840,35 @@ export function streamCursorAgent(
       stopReason: "stop",
       timestamp: Date.now(),
     };
+    const startParams: StartLiveSessionParams = {
+      pi,
+      getCtx,
+      state,
+      model,
+      context,
+      options,
+      sessionId,
+    };
     let session: LiveSession | undefined;
-    let effectiveSignal = options?.signal;
-    let steerEpochAtStart = 0;
 
     try {
       session = getLiveSession(sessionId);
-
-      if (!session) {
-        const apiKey = options?.apiKey;
-        if (!apiKey) {
-          throw new Error(
-            "Cursor API key (access token) is required. Run /login cursor or set CURSOR_ACCESS_TOKEN.",
-          );
-        }
-
-        const agentStore = await ensureAgentStore(sessionId);
-        const cwd = getCtx()?.cwd ?? process.cwd();
-        const requestContextTools = getContextTools(context);
-
-        const channel = new LiveEventChannel(sessionId);
-        const sessionAbortController = new AbortController();
-        const sessionSignal = sessionAbortController.signal;
-        effectiveSignal = options?.signal ?? sessionSignal;
-
-        const piToolCtx: PiToolContext = {
-          cwd,
-          signal: sessionSignal,
-          getActiveTools: () => new Set(pi.getActiveTools()),
-          getCtx,
-          getChannel: () => channel,
-        };
-
-        const piContext = await preparePiContext(context.systemPrompt ?? "");
-
-        const resources = new LocalResourceProvider({
-          ctx: piToolCtx,
-          requestContextTools,
-          cursorRules: piContext.rules,
-        });
-
-        const blobStore = agentStore.getBlobStore();
-        const cursorModelId = toCursorId(model.id, options?.reasoning);
-        const overlayState = createOverlayState(state);
-        const { initialRequest, conversationState } = buildRunRequest({
-          model: { ...model, id: cursorModelId },
-          context,
-          conversationId: agentStore.getId(),
-          blobStore,
-          conversationState: agentStore.getConversationStateStructure(),
-          mcpToolDefinitions: requestContextTools,
-          state: overlayState,
-          systemPromptOverride: piContext.cleanedPrompt,
-        });
-        agentStore.conversationStateStructure = conversationState;
-
-        let lastFlushedRootBlobId: string | undefined;
-        const flushSessionState = async () => {
-          const snapshot = await persistAgentStore(sessionId);
-          if (!snapshot || snapshot.latestRootBlobId === lastFlushedRootBlobId)
-            return;
-          lastFlushedRootBlobId = snapshot.latestRootBlobId;
-          pi.appendEntry(CURSOR_STATE_ENTRY_TYPE, snapshot);
-        };
-
-        const handleInteractionUpdate = (update: CoreInteractionUpdate) => {
-          switch (update.type) {
-            case "text-delta":
-              channel.push({
-                kind: "content",
-                data: { kind: "text-delta", text: update.text },
-              });
-              return;
-            case "thinking-delta":
-              channel.push({
-                kind: "content",
-                data: { kind: "thinking-delta", text: update.text },
-              });
-              return;
-            case "thinking-completed":
-              channel.push({
-                kind: "content",
-                data: { kind: "thinking-completed", text: "" },
-              });
-              return;
-            case "token-delta":
-              channel.push({ kind: "token-delta", tokens: update.tokens });
-              return;
-            case "user-message-appended": {
-              const userMessage = update.userMessage as
-                | { messageId?: unknown }
-                | undefined;
-              const messageId = userMessage?.messageId;
-              if (typeof messageId === "string" && messageId.length > 0) {
-                dispatcher.ackUserMessage(messageId);
-              }
-              return;
-            }
-            default:
-              return;
-          }
-        };
-
-        const baseUrl = model.baseUrl || CURSOR_API_URL;
-        const agentService = new AgentService(baseUrl, {
-          accessToken: apiKey,
-          clientVersion: CURSOR_CLIENT_VERSION,
-          clientType: "cli",
-        });
-        const connectClient = new AgentConnectClient(agentService.rpcClient);
-        const interactionListener = createInteractionListenerAdapter(
-          handleInteractionUpdate,
-        );
-        const checkpointHandler = createCheckpointHandler(
-          (checkpoint: ConversationStateStructure) => {
-            void agentStore.handleCheckpoint(null, checkpoint);
-          },
-        );
-        checkpointHandler.getLatestCheckpoint = () =>
-          agentStore.getConversationStateStructure();
-
-        // Dispatcher for mid-stream user messages (steer / followUp).
-        // It re-binds on every (re)connect so that messages stranded by a
-        // dropped connection are redelivered as soon as a new stream opens.
-        const dispatcher = createMessageDispatcher();
-        let steerInFlight = 0;
-        let lastSteerAttemptAt = 0;
-        let steerEpoch = 0;
-
-        const runOptions: Parameters<typeof connectClient.run>[1] = {
-          interactionListener,
-          resources,
-          blobStore,
-          checkpointHandler,
-          signal: sessionSignal,
-          onRequestStreamCreated: (stream) => {
-            // Best-effort bind. Errors here would otherwise propagate into
-            // connect.ts and abort the run; the dispatcher already handles
-            // write failures internally by re-queueing messages.
-            void dispatcher.bind(stream).catch(() => {});
-          },
-        };
-
-        const cursorRunPromise = connectClient
-          .run(initialRequest, runOptions)
-          .then(() => channel.push({ kind: "cursor-done" }))
-          .catch((error) => channel.push({ kind: "cursor-error", error }))
-          .finally(() => {
-            dispatcher.close();
-            channel.markDone();
-          });
-
-        session = {
-          channel,
-          cursorRunPromise,
-          flushSessionState,
-          abort: (reason) => {
-            dispatcher.close();
-            sessionAbortController.abort(
-              reason ? new Error(reason) : new Error("Session ended"),
-            );
-          },
-          startTime: Date.now(),
-          steer: async (text) => {
-            steerEpoch++;
-            steerInFlight++;
-            lastSteerAttemptAt = Date.now();
-            try {
-              await dispatcher.steer(text);
-            } finally {
-              steerInFlight = Math.max(0, steerInFlight - 1);
-              lastSteerAttemptAt = Date.now();
-            }
-          },
-          followUp: (text) => dispatcher.followUp(text),
-          getSteerEpoch: () => steerEpoch,
-          markSteerIntent: () => {
-            steerEpoch++;
-            lastSteerAttemptAt = Date.now();
-          },
-          wasRecentSteerAttempt: () =>
-            steerInFlight > 0 ||
-            Date.now() - lastSteerAttemptAt <= STEER_ABORT_GRACE_WINDOW_MS,
-        };
-        setLiveSession(sessionId, session);
-        markContextUserMessagesSeen(sessionId, context);
+      if (session) {
+        session.linkAbort(options?.signal);
+        // Tool results and adopted steers reach the run from here on.
+        session.markCheckpointStale();
+        adoptNewUserMessages(session, context);
+      } else {
+        session = await startLiveSession(startParams);
       }
-
-      if (!session) {
-        throw new Error(`Failed to initialize live session: ${sessionId}`);
-      }
-      const liveSession = session;
-      steerEpochAtStart = liveSession.getSteerEpoch?.() ?? 0;
-      await bridgeQueuedInteractiveInputs(sessionId, context, liveSession);
 
       const usageState = { sawTokenDelta: false };
-      let firstTokenTimeCaptured = false;
-
       stream.push({ type: "start", partial: output });
 
-      let result: Awaited<ReturnType<typeof consumeUntilBoundary>>;
-      try {
-        result = await consumeUntilBoundary(
+      while (true) {
+        const liveSession: LiveSession = session;
+        let firstTokenTimeCaptured = false;
+        const result = await consumeUntilBoundary(
           liveSession.channel,
           output,
           stream,
@@ -737,116 +883,126 @@ export function streamCursorAgent(
           },
           options?.signal,
         );
-      } catch (error) {
-        const steerAbort =
-          isAbortLikeError(error, options?.signal) &&
-          ((liveSession.getSteerEpoch?.() ?? steerEpochAtStart) >
-            steerEpochAtStart ||
-            liveSession.wasRecentSteerAttempt?.() === true);
-        if (!steerAbort) {
-          throw error;
+
+        if (result.reason === "stop") {
+          // Steers already in Pi's context that this run did not take go out
+          // as the next run, answered in this same Pi message.
+          const owed = liveSession.steers.settle();
+          if (owed.length > 0) {
+            // The finished run stays registered until its successor starts,
+            // so a termination in between stops the handoff.
+            void runSessionTeardown(sessionId, async (isCurrent) => {
+              await liveSession.cursorRunPromise;
+              await liveSession.flushSessionState(isCurrent).catch(() => {});
+            });
+            const checkpointed = liveSession.hasCurrentCheckpoint();
+            session = await startLiveSession(
+              checkpointed
+                ? startParams
+                : {
+                    ...startParams,
+                    context: contextForOwedRun(context, output, owed),
+                  },
+              {
+                userText: owed.join("\n\n"),
+                ignoreCachedState: !checkpointed,
+                replaces: liveSession,
+              },
+            );
+            continue;
+          }
         }
 
-        // A steer handoff can abort the current request signal while the
-        // underlying Cursor run is still alive. Continue consuming events from
-        // the live channel so the steered turn can complete normally.
-        result = await consumeUntilBoundary(
-          liveSession.channel,
-          output,
-          stream,
-          usageState,
-          () => {
-            if (!firstTokenTimeCaptured) {
-              firstTokenTimeCaptured = true;
-              if (!liveSession.firstTokenTime) {
-                liveSession.firstTokenTime = Date.now();
-              }
-            }
-          },
-        );
-      }
+        output.duration = Date.now() - liveSession.startTime;
+        if (liveSession.firstTokenTime) {
+          output.ttft = liveSession.firstTokenTime - liveSession.startTime;
+        }
+        output.usage.cost = {
+          input: 0,
+          output: 0,
+          cacheRead: 0,
+          cacheWrite: 0,
+          total: 0,
+        };
 
-      output.duration = Date.now() - liveSession.startTime;
-      if (liveSession.firstTokenTime) {
-        output.ttft = liveSession.firstTokenTime - liveSession.startTime;
-      }
-      output.usage.cost = {
-        input: 0,
-        output: 0,
-        cacheRead: 0,
-        cacheWrite: 0,
-        total: 0,
-      };
-
-      if (result.reason === "toolUse" && result.tools.length > 0) {
-        emitToolCalls(result.tools, output, stream, state);
-        output.stopReason = "toolUse";
-
+        if (result.reason === "toolUse" && result.tools.length > 0) {
+          emitToolCalls(result.tools, output, stream, state);
+          output.stopReason = "toolUse";
+        } else {
+          output.stopReason = "stop";
+        }
         state.rememberAssistantContent({
           timestamp: output.timestamp,
           blocks: serializeContentBlocks(output.content),
         });
-        try {
-          await session.flushSessionState();
-        } catch {}
 
-        stream.push({
-          type: "done",
-          reason: "toolUse",
-          message: { ...output },
-        });
-      } else {
-        output.stopReason = "stop";
+        if (result.reason === "toolUse") {
+          // The run stays live; Pi reattaches after the tool batch.
+          await unlessAborted(
+            runSessionTeardown(sessionId, (isCurrent) =>
+              liveSession.flushSessionState(isCurrent).catch(() => {}),
+            ),
+            options?.signal,
+          );
+          stream.push({
+            type: "done",
+            reason: output.stopReason,
+            message: { ...output },
+          });
+          break;
+        }
 
-        state.rememberAssistantContent({
-          timestamp: output.timestamp,
-          blocks: serializeContentBlocks(output.content),
-        });
-        let flushed = false;
-        try {
-          await session.flushSessionState();
-          flushed = true;
-        } catch {}
-        deleteLiveSession(sessionId);
-        await session.cursorRunPromise;
-        await evictAgentStore(sessionId, { persist: !flushed }).catch(() => {});
+        if (getLiveSession(sessionId) === liveSession) {
+          deleteLiveSession(sessionId);
+          // Not awaited: the next run waits for it (`awaitSessionTeardown`).
+          void runSessionTeardown(sessionId, async (isCurrent) => {
+            let flushed = false;
+            try {
+              await liveSession.flushSessionState(isCurrent);
+              flushed = true;
+            } catch {}
+            await liveSession.cursorRunPromise;
+            await evictAgentStore(sessionId, {
+              persist: !flushed,
+              isCurrent,
+            }).catch(() => {});
+          });
+        }
         stream.push({ type: "done", reason: "stop", message: output });
+        break;
       }
       stream.end();
     } catch (error) {
-      const wasAborted = isAbortLikeError(error, effectiveSignal);
-      const steerAbort =
-        wasAborted &&
-        ((session?.getSteerEpoch?.() ?? steerEpochAtStart) >
-          steerEpochAtStart ||
-          session?.wasRecentSteerAttempt?.() === true);
-      if (steerAbort) {
-        output.stopReason = "stop";
-        stream.push({ type: "done", reason: "stop", message: output });
-        stream.end();
-        return;
-      }
-
-      if (wasAborted && session && !session.wasRecentSteerAttempt?.()) {
-        session.abort(REQUEST_ABORTED_MESSAGE);
-      }
+      const wasAborted = isAbortLikeError(error, options?.signal);
       output.stopReason = wasAborted ? "aborted" : "error";
       output.errorMessage =
         error instanceof Error ? error.message : String(error);
-      let flushed = false;
-      try {
-        if (session) {
-          await session.flushSessionState();
-          flushed = true;
-          await session.cursorRunPromise.catch(() => {});
+
+      // Pi never aborts a stream to steer, so every abort is a real cancel.
+      // A startup that failed before registering created nothing to clean
+      // up. A session no longer registered was already torn down by whoever
+      // deregistered it, and the store may belong to a newer run by now.
+      const failed = session;
+      if (failed) {
+        failed.abort(REQUEST_ABORTED_MESSAGE);
+        if (getLiveSession(sessionId) === failed) {
+          deleteLiveSession(sessionId);
+          // Not awaited: it can queue behind a stalled teardown, and the next
+          // run waits for it anyway.
+          void runSessionTeardown(sessionId, async (isCurrent) => {
+            let flushed = false;
+            try {
+              await failed.flushSessionState(isCurrent);
+              flushed = true;
+            } catch {}
+            await failed.cursorRunPromise.catch(() => {});
+            await evictAgentStore(sessionId, {
+              persist: !flushed,
+              isCurrent,
+            }).catch(() => {});
+          });
         }
-      } catch {}
-      deleteLiveSession(sessionId);
-      rejectPendingForSession(
-        sessionId,
-        `Stream error: ${output.errorMessage}`,
-      );
-      await evictAgentStore(sessionId, { persist: !flushed }).catch(() => {});
+      }
       stream.push({
         type: "error",
         reason: wasAborted ? "aborted" : "error",

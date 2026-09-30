@@ -940,6 +940,12 @@ export class ConversationAction extends Message<ConversationAction> {
      */
     value: AsyncAskQuestionCompletionAction;
     case: "asyncAskQuestionCompletionAction";
+  } | {
+    /**
+     * @generated from field: agent.v1.InjectContextAction inject_context_action = 19;
+     */
+    value: InjectContextAction;
+    case: "injectContextAction";
   } | { case: undefined; value?: undefined } = { case: undefined };
 
   constructor(data?: PartialMessage<ConversationAction>) {
@@ -959,6 +965,7 @@ export class ConversationAction extends Message<ConversationAction> {
     { no: 6, name: "start_plan_action", kind: "message", T: StartPlanAction, oneof: "action" },
     { no: 7, name: "execute_plan_action", kind: "message", T: ExecutePlanAction, oneof: "action" },
     { no: 8, name: "async_ask_question_completion_action", kind: "message", T: AsyncAskQuestionCompletionAction, oneof: "action" },
+    { no: 19, name: "inject_context_action", kind: "message", T: InjectContextAction, oneof: "action" },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ConversationAction {
@@ -975,6 +982,447 @@ export class ConversationAction extends Message<ConversationAction> {
 
   static equals(a: ConversationAction | PlainMessage<ConversationAction> | undefined, b: ConversationAction | PlainMessage<ConversationAction> | undefined): boolean {
     return proto3.util.equals(ConversationAction, a, b);
+  }
+}
+
+/**
+ * @generated from message agent.v1.InjectContextAction
+ */
+export class InjectContextAction extends Message<InjectContextAction> {
+  /**
+   * @generated from field: string injection_id = 1;
+   */
+  injectionId = "";
+
+  /**
+   * @generated from field: string expected_run_id = 2;
+   */
+  expectedRunId = "";
+
+  /**
+   * @generated from oneof agent.v1.InjectContextAction.payload
+   */
+  payload: {
+    /**
+     * @generated from field: agent.v1.UserContextInjection user_context = 3;
+     */
+    value: UserContextInjection;
+    case: "userContext";
+  } | {
+    /**
+     * @generated from field: agent.v1.SystemContextInjection system_context = 4;
+     */
+    value: SystemContextInjection;
+    case: "systemContext";
+  } | { case: undefined; value?: undefined } = { case: undefined };
+
+  constructor(data?: PartialMessage<InjectContextAction>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "agent.v1.InjectContextAction";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "injection_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "expected_run_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "user_context", kind: "message", T: UserContextInjection, oneof: "payload" },
+    { no: 4, name: "system_context", kind: "message", T: SystemContextInjection, oneof: "payload" },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): InjectContextAction {
+    return new InjectContextAction().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): InjectContextAction {
+    return new InjectContextAction().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): InjectContextAction {
+    return new InjectContextAction().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: InjectContextAction | PlainMessage<InjectContextAction> | undefined, b: InjectContextAction | PlainMessage<InjectContextAction> | undefined): boolean {
+    return proto3.util.equals(InjectContextAction, a, b);
+  }
+}
+
+/**
+ * @generated from message agent.v1.UserContextInjection
+ */
+export class UserContextInjection extends Message<UserContextInjection> {
+  /**
+   * @generated from field: agent.v1.UserMessage user_message = 1;
+   */
+  userMessage?: UserMessage;
+
+  /**
+   * @generated from field: agent.v1.RequestContext request_context = 2;
+   */
+  requestContext?: RequestContext;
+
+  constructor(data?: PartialMessage<UserContextInjection>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "agent.v1.UserContextInjection";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "user_message", kind: "message", T: UserMessage },
+    { no: 2, name: "request_context", kind: "message", T: RequestContext },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): UserContextInjection {
+    return new UserContextInjection().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): UserContextInjection {
+    return new UserContextInjection().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): UserContextInjection {
+    return new UserContextInjection().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: UserContextInjection | PlainMessage<UserContextInjection> | undefined, b: UserContextInjection | PlainMessage<UserContextInjection> | undefined): boolean {
+    return proto3.util.equals(UserContextInjection, a, b);
+  }
+}
+
+/**
+ * @generated from message agent.v1.SystemContextInjection
+ */
+export class SystemContextInjection extends Message<SystemContextInjection> {
+  /**
+   * @generated from field: string producer = 1;
+   */
+  producer = "";
+
+  /**
+   * @generated from field: string content = 2;
+   */
+  content = "";
+
+  constructor(data?: PartialMessage<SystemContextInjection>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "agent.v1.SystemContextInjection";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "producer", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "content", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): SystemContextInjection {
+    return new SystemContextInjection().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): SystemContextInjection {
+    return new SystemContextInjection().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): SystemContextInjection {
+    return new SystemContextInjection().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: SystemContextInjection | PlainMessage<SystemContextInjection> | undefined, b: SystemContextInjection | PlainMessage<SystemContextInjection> | undefined): boolean {
+    return proto3.util.equals(SystemContextInjection, a, b);
+  }
+}
+
+/**
+ * @generated from message agent.v1.ContextInjectionState
+ */
+export class ContextInjectionState extends Message<ContextInjectionState> {
+  /**
+   * @generated from oneof agent.v1.ContextInjectionState.state
+   */
+  state: {
+    /**
+     * @generated from field: agent.v1.ContextInjectionQueued queued = 1;
+     */
+    value: ContextInjectionQueued;
+    case: "queued";
+  } | {
+    /**
+     * @generated from field: agent.v1.ContextInjectionDelivered delivered = 2;
+     */
+    value: ContextInjectionDelivered;
+    case: "delivered";
+  } | {
+    /**
+     * @generated from field: agent.v1.ContextInjectionQueuedForNextTurn queued_for_next_turn = 3;
+     */
+    value: ContextInjectionQueuedForNextTurn;
+    case: "queuedForNextTurn";
+  } | {
+    /**
+     * @generated from field: agent.v1.ContextInjectionCancelled cancelled = 4;
+     */
+    value: ContextInjectionCancelled;
+    case: "cancelled";
+  } | {
+    /**
+     * @generated from field: agent.v1.ContextInjectionRejected rejected = 5;
+     */
+    value: ContextInjectionRejected;
+    case: "rejected";
+  } | { case: undefined; value?: undefined } = { case: undefined };
+
+  constructor(data?: PartialMessage<ContextInjectionState>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "agent.v1.ContextInjectionState";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "queued", kind: "message", T: ContextInjectionQueued, oneof: "state" },
+    { no: 2, name: "delivered", kind: "message", T: ContextInjectionDelivered, oneof: "state" },
+    { no: 3, name: "queued_for_next_turn", kind: "message", T: ContextInjectionQueuedForNextTurn, oneof: "state" },
+    { no: 4, name: "cancelled", kind: "message", T: ContextInjectionCancelled, oneof: "state" },
+    { no: 5, name: "rejected", kind: "message", T: ContextInjectionRejected, oneof: "state" },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ContextInjectionState {
+    return new ContextInjectionState().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ContextInjectionState {
+    return new ContextInjectionState().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ContextInjectionState {
+    return new ContextInjectionState().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ContextInjectionState | PlainMessage<ContextInjectionState> | undefined, b: ContextInjectionState | PlainMessage<ContextInjectionState> | undefined): boolean {
+    return proto3.util.equals(ContextInjectionState, a, b);
+  }
+}
+
+/**
+ * @generated from message agent.v1.ContextInjectionQueued
+ */
+export class ContextInjectionQueued extends Message<ContextInjectionQueued> {
+  constructor(data?: PartialMessage<ContextInjectionQueued>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "agent.v1.ContextInjectionQueued";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ContextInjectionQueued {
+    return new ContextInjectionQueued().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ContextInjectionQueued {
+    return new ContextInjectionQueued().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ContextInjectionQueued {
+    return new ContextInjectionQueued().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ContextInjectionQueued | PlainMessage<ContextInjectionQueued> | undefined, b: ContextInjectionQueued | PlainMessage<ContextInjectionQueued> | undefined): boolean {
+    return proto3.util.equals(ContextInjectionQueued, a, b);
+  }
+}
+
+/**
+ * @generated from message agent.v1.ContextInjectionDelivered
+ */
+export class ContextInjectionDelivered extends Message<ContextInjectionDelivered> {
+  /**
+   * @generated from field: int32 step = 1;
+   */
+  step = 0;
+
+  /**
+   * @generated from field: string delivery_batch_id = 2;
+   */
+  deliveryBatchId = "";
+
+  /**
+   * @generated from field: int64 delivered_at_ms = 3;
+   */
+  deliveredAtMs = protoInt64.zero;
+
+  constructor(data?: PartialMessage<ContextInjectionDelivered>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "agent.v1.ContextInjectionDelivered";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "step", kind: "scalar", T: 5 /* ScalarType.INT32 */ },
+    { no: 2, name: "delivery_batch_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 3, name: "delivered_at_ms", kind: "scalar", T: 3 /* ScalarType.INT64 */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ContextInjectionDelivered {
+    return new ContextInjectionDelivered().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ContextInjectionDelivered {
+    return new ContextInjectionDelivered().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ContextInjectionDelivered {
+    return new ContextInjectionDelivered().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ContextInjectionDelivered | PlainMessage<ContextInjectionDelivered> | undefined, b: ContextInjectionDelivered | PlainMessage<ContextInjectionDelivered> | undefined): boolean {
+    return proto3.util.equals(ContextInjectionDelivered, a, b);
+  }
+}
+
+/**
+ * @generated from message agent.v1.ContextInjectionQueuedForNextTurn
+ */
+export class ContextInjectionQueuedForNextTurn extends Message<ContextInjectionQueuedForNextTurn> {
+  constructor(data?: PartialMessage<ContextInjectionQueuedForNextTurn>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "agent.v1.ContextInjectionQueuedForNextTurn";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ContextInjectionQueuedForNextTurn {
+    return new ContextInjectionQueuedForNextTurn().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ContextInjectionQueuedForNextTurn {
+    return new ContextInjectionQueuedForNextTurn().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ContextInjectionQueuedForNextTurn {
+    return new ContextInjectionQueuedForNextTurn().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ContextInjectionQueuedForNextTurn | PlainMessage<ContextInjectionQueuedForNextTurn> | undefined, b: ContextInjectionQueuedForNextTurn | PlainMessage<ContextInjectionQueuedForNextTurn> | undefined): boolean {
+    return proto3.util.equals(ContextInjectionQueuedForNextTurn, a, b);
+  }
+}
+
+/**
+ * @generated from message agent.v1.ContextInjectionCancelled
+ */
+export class ContextInjectionCancelled extends Message<ContextInjectionCancelled> {
+  constructor(data?: PartialMessage<ContextInjectionCancelled>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "agent.v1.ContextInjectionCancelled";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ContextInjectionCancelled {
+    return new ContextInjectionCancelled().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ContextInjectionCancelled {
+    return new ContextInjectionCancelled().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ContextInjectionCancelled {
+    return new ContextInjectionCancelled().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ContextInjectionCancelled | PlainMessage<ContextInjectionCancelled> | undefined, b: ContextInjectionCancelled | PlainMessage<ContextInjectionCancelled> | undefined): boolean {
+    return proto3.util.equals(ContextInjectionCancelled, a, b);
+  }
+}
+
+/**
+ * @generated from message agent.v1.ContextInjectionRejected
+ */
+export class ContextInjectionRejected extends Message<ContextInjectionRejected> {
+  /**
+   * @generated from field: string reason = 1;
+   */
+  reason = "";
+
+  constructor(data?: PartialMessage<ContextInjectionRejected>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "agent.v1.ContextInjectionRejected";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "reason", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ContextInjectionRejected {
+    return new ContextInjectionRejected().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ContextInjectionRejected {
+    return new ContextInjectionRejected().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ContextInjectionRejected {
+    return new ContextInjectionRejected().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ContextInjectionRejected | PlainMessage<ContextInjectionRejected> | undefined, b: ContextInjectionRejected | PlainMessage<ContextInjectionRejected> | undefined): boolean {
+    return proto3.util.equals(ContextInjectionRejected, a, b);
+  }
+}
+
+/**
+ * @generated from message agent.v1.ContextInjectionStateUpdate
+ */
+export class ContextInjectionStateUpdate extends Message<ContextInjectionStateUpdate> {
+  /**
+   * @generated from field: string injection_id = 1;
+   */
+  injectionId = "";
+
+  /**
+   * @generated from field: agent.v1.ContextInjectionState state = 2;
+   */
+  state?: ContextInjectionState;
+
+  constructor(data?: PartialMessage<ContextInjectionStateUpdate>) {
+    super();
+    proto3.util.initPartial(data, this);
+  }
+
+  static readonly runtime: typeof proto3 = proto3;
+  static readonly typeName = "agent.v1.ContextInjectionStateUpdate";
+  static readonly fields: FieldList = proto3.util.newFieldList(() => [
+    { no: 1, name: "injection_id", kind: "scalar", T: 9 /* ScalarType.STRING */ },
+    { no: 2, name: "state", kind: "message", T: ContextInjectionState },
+  ]);
+
+  static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): ContextInjectionStateUpdate {
+    return new ContextInjectionStateUpdate().fromBinary(bytes, options);
+  }
+
+  static fromJson(jsonValue: JsonValue, options?: Partial<JsonReadOptions>): ContextInjectionStateUpdate {
+    return new ContextInjectionStateUpdate().fromJson(jsonValue, options);
+  }
+
+  static fromJsonString(jsonString: string, options?: Partial<JsonReadOptions>): ContextInjectionStateUpdate {
+    return new ContextInjectionStateUpdate().fromJsonString(jsonString, options);
+  }
+
+  static equals(a: ContextInjectionStateUpdate | PlainMessage<ContextInjectionStateUpdate> | undefined, b: ContextInjectionStateUpdate | PlainMessage<ContextInjectionStateUpdate> | undefined): boolean {
+    return proto3.util.equals(ContextInjectionStateUpdate, a, b);
   }
 }
 
@@ -3595,6 +4043,12 @@ export class InteractionUpdate extends Message<InteractionUpdate> {
      */
     value: StepCompletedUpdate;
     case: "stepCompleted";
+  } | {
+    /**
+     * @generated from field: agent.v1.ContextInjectionStateUpdate context_injection_state = 23;
+     */
+    value: ContextInjectionStateUpdate;
+    case: "contextInjectionState";
   } | { case: undefined; value?: undefined } = { case: undefined };
 
   constructor(data?: PartialMessage<InteractionUpdate>) {
@@ -3622,6 +4076,7 @@ export class InteractionUpdate extends Message<InteractionUpdate> {
     { no: 14, name: "turn_ended", kind: "message", T: TurnEndedUpdate, oneof: "message" },
     { no: 16, name: "step_started", kind: "message", T: StepStartedUpdate, oneof: "message" },
     { no: 17, name: "step_completed", kind: "message", T: StepCompletedUpdate, oneof: "message" },
+    { no: 23, name: "context_injection_state", kind: "message", T: ContextInjectionStateUpdate, oneof: "message" },
   ]);
 
   static fromBinary(bytes: Uint8Array, options?: Partial<BinaryReadOptions>): InteractionUpdate {

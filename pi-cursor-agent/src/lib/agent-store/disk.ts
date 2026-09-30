@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { type AgentMetadata, fromHex, toHex } from "../../vendor/agent-kv";
@@ -30,6 +31,9 @@ const getBlobsFilePath = (baseDir: string, sessionId: string): string =>
 
 const getMetaFilePath = (baseDir: string, sessionId: string): string =>
   path.join(getSessionDir(baseDir, sessionId), "meta.json");
+
+/** Tells a write whether it may still replace the files once they are ready. */
+export type ShouldCommit = () => boolean;
 
 export const loadBlobsFromDisk = async (
   baseDir: string,
@@ -64,13 +68,7 @@ export const loadBlobsFromDisk = async (
   }
 };
 
-export const saveBlobsToDisk = async (
-  baseDir: string,
-  sessionId: string,
-  blobs: Map<string, Uint8Array>,
-): Promise<void> => {
-  const dir = getSessionDir(baseDir, sessionId);
-  await fs.mkdir(dir, { recursive: true });
+const blobsFileContents = (blobs: Map<string, Uint8Array>): string => {
   const file: BlobsFile = {
     version: 1,
     blobs: Array.from(blobs.entries()).map(([id, data]) => ({
@@ -78,10 +76,7 @@ export const saveBlobsToDisk = async (
       data: Buffer.from(data).toString("base64"),
     })),
   };
-  const filePath = getBlobsFilePath(baseDir, sessionId);
-  const tmpPath = `${filePath}.tmp`;
-  await fs.writeFile(tmpPath, JSON.stringify(file), "utf-8");
-  await fs.rename(tmpPath, filePath);
+  return JSON.stringify(file);
 };
 
 export const loadMetaFromDisk = async (
@@ -114,13 +109,7 @@ export const loadMetaFromDisk = async (
   }
 };
 
-export const saveMetaToDisk = async (
-  baseDir: string,
-  sessionId: string,
-  metadata: AgentMetadata,
-): Promise<void> => {
-  const dir = getSessionDir(baseDir, sessionId);
-  await fs.mkdir(dir, { recursive: true });
+const metaFileContents = (metadata: AgentMetadata): string => {
   const file: MetaFile = {
     version: 1,
     agentId: metadata.agentId,
@@ -132,8 +121,66 @@ export const saveMetaToDisk = async (
       lastUsedModel: metadata.lastUsedModel,
     }),
   };
-  const filePath = getMetaFilePath(baseDir, sessionId);
-  const tmpPath = `${filePath}.tmp`;
-  await fs.writeFile(tmpPath, JSON.stringify(file), "utf-8");
-  await fs.rename(tmpPath, filePath);
+  return JSON.stringify(file);
+};
+
+/** Commit phases per session directory, so an older commit can't land after a newer one. */
+const commitQueues = new Map<string, Promise<void>>();
+
+const inCommitQueue = async (
+  dir: string,
+  commit: () => Promise<void>,
+): Promise<void> => {
+  const previous = commitQueues.get(dir) ?? Promise.resolve();
+  const current = previous.then(commit);
+  const settled = current.catch(() => {});
+  commitQueues.set(dir, settled);
+  try {
+    await current;
+  } finally {
+    if (commitQueues.get(dir) === settled) commitQueues.delete(dir);
+  }
+};
+
+/**
+ * Write both store files. Each is staged under a unique temporary name. Then,
+ * in the session's commit queue, `shouldCommit` is asked once: if it allows,
+ * blobs are renamed into place before metadata, so metadata never names a
+ * root blob missing from disk.
+ */
+export const saveStoreToDisk = async (
+  baseDir: string,
+  sessionId: string,
+  blobs: Map<string, Uint8Array>,
+  metadata: AgentMetadata,
+  shouldCommit?: ShouldCommit,
+): Promise<void> => {
+  const dir = getSessionDir(baseDir, sessionId);
+  await fs.mkdir(dir, { recursive: true });
+  const staged = [
+    {
+      path: getBlobsFilePath(baseDir, sessionId),
+      contents: blobsFileContents(blobs),
+    },
+    {
+      path: getMetaFilePath(baseDir, sessionId),
+      contents: metaFileContents(metadata),
+    },
+  ].map((file) => ({ ...file, tmpPath: `${file.path}.${randomUUID()}.tmp` }));
+
+  try {
+    await Promise.all(
+      staged.map((file) => fs.writeFile(file.tmpPath, file.contents, "utf-8")),
+    );
+    await inCommitQueue(dir, async () => {
+      if (shouldCommit && !shouldCommit()) return;
+      for (const file of staged) {
+        await fs.rename(file.tmpPath, file.path);
+      }
+    });
+  } finally {
+    await Promise.all(
+      staged.map((file) => fs.rm(file.tmpPath, { force: true })),
+    );
+  }
 };

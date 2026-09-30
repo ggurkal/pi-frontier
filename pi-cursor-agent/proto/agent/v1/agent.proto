@@ -185,7 +185,58 @@ message ConversationAction {
     StartPlanAction start_plan_action = 6;
     ExecutePlanAction execute_plan_action = 7;
     AsyncAskQuestionCompletionAction async_ask_question_completion_action = 8;
+    InjectContextAction inject_context_action = 19;
   }
+}
+
+message InjectContextAction {
+  string injection_id = 1;
+  string expected_run_id = 2;
+  oneof payload {
+    UserContextInjection user_context = 3;
+    SystemContextInjection system_context = 4;
+  }
+}
+
+message UserContextInjection {
+  UserMessage user_message = 1;
+  RequestContext request_context = 2;
+}
+
+message SystemContextInjection {
+  string producer = 1;
+  string content = 2;
+}
+
+message ContextInjectionState {
+  oneof state {
+    ContextInjectionQueued queued = 1;
+    ContextInjectionDelivered delivered = 2;
+    ContextInjectionQueuedForNextTurn queued_for_next_turn = 3;
+    ContextInjectionCancelled cancelled = 4;
+    ContextInjectionRejected rejected = 5;
+  }
+}
+
+message ContextInjectionQueued {}
+
+message ContextInjectionDelivered {
+  int32 step = 1;
+  string delivery_batch_id = 2;
+  int64 delivered_at_ms = 3;
+}
+
+message ContextInjectionQueuedForNextTurn {}
+
+message ContextInjectionCancelled {}
+
+message ContextInjectionRejected {
+  string reason = 1;
+}
+
+message ContextInjectionStateUpdate {
+  string injection_id = 1;
+  ContextInjectionState state = 2;
 }
 
 message UserMessageAction {
@@ -518,6 +569,7 @@ message InteractionUpdate {
     TurnEndedUpdate turn_ended = 14;
     StepStartedUpdate step_started = 16;
     StepCompletedUpdate step_completed = 17;
+    ContextInjectionStateUpdate context_injection_state = 23;
   }
 }
 

@@ -114,7 +114,17 @@ export type CoreInteractionUpdate =
       modelCallId: string;
     }
   | { type: "step-started"; stepId: number }
-  | { type: "step-completed"; stepId: number; stepDurationMs: number };
+  | { type: "step-completed"; stepId: number; stepDurationMs: number }
+  | {
+      type: "context-injection-state";
+      injectionId: string;
+      state:
+        | "queued"
+        | "delivered"
+        | "queuedForNextTurn"
+        | "cancelled"
+        | "rejected";
+    };
 
 export type CoreInteractionQuery =
   | { type: "web-search-request"; args: unknown }
@@ -254,6 +264,15 @@ export function convertProtoToInteractionUpdate(
         stepId: Number(update.message.value.stepId),
         stepDurationMs: Number(update.message.value.stepDurationMs),
       };
+    case "contextInjectionState": {
+      const injectionState = update.message.value.state?.state.case;
+      if (!injectionState) return null;
+      return {
+        type: "context-injection-state",
+        injectionId: update.message.value.injectionId,
+        state: injectionState,
+      };
+    }
     default:
       return null;
   }

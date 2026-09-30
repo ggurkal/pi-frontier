@@ -66,9 +66,7 @@ export interface AgentConnectRunOptions {
 
 const HEARTBEAT_INTERVAL_MS = 5_000;
 const MAX_RETRY_ATTEMPTS = 5;
-const CURSOR_ABORT_BRACKET_PATTERN =
-  /\[(?:canceled|aborted)\].*\[(?:canceled|aborted)\]/i;
-const USER_ABORTED_REQUEST_MESSAGE = "User aborted request";
+export const ORIGINAL_REQUEST_ID_HEADER = "x-original-request-id";
 
 function createNoopStallDetector(): StallDetector {
   return {
@@ -81,14 +79,22 @@ function createNoopStallDetector(): StallDetector {
 function isRetriableError(error: unknown): boolean {
   if (error instanceof LostConnection) return true;
   if (error instanceof Error && error.message.includes("NGHTTP2")) return true;
-  if (
-    error instanceof Error &&
-    (CURSOR_ABORT_BRACKET_PATTERN.test(error.message) ||
-      error.message.includes(USER_ABORTED_REQUEST_MESSAGE))
-  ) {
-    return true;
-  }
   return false;
+}
+
+/**
+ * Retries keep `x-original-request-id` (the generation id the server matches
+ * `expectedRunId` against) and get a fresh `x-request-id`, like Cursor desktop.
+ */
+function attemptHeaders(
+  headers: Record<string, string> | undefined,
+  attempt: number,
+): { headers?: Record<string, string> } {
+  if (!headers) return {};
+  if (attempt === 0 || !headers[ORIGINAL_REQUEST_ID_HEADER]) {
+    return { headers };
+  }
+  return { headers: { ...headers, "x-request-id": crypto.randomUUID() } };
 }
 
 async function backoff(attempt: number, signal?: AbortSignal): Promise<void> {
@@ -187,6 +193,7 @@ export class AgentConnectClient {
 
         await this.runInternal(request, {
           ...options,
+          ...attemptHeaders(options.headers, attempt),
           checkpointHandler: trackingCheckpointHandler,
         });
         return;

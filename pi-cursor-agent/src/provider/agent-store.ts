@@ -54,8 +54,13 @@ export const ensureAgentStore = async (
 
 export const persistAgentStore = async (
   sessionId: string,
+  isCurrent?: () => boolean,
 ): Promise<AgentStoreSnapshot | null> => {
-  const entry = await persistStore(PI_CURSOR_AGENT_CACHE_DIR, sessionId);
+  const entry = await persistStore(
+    PI_CURSOR_AGENT_CACHE_DIR,
+    sessionId,
+    isCurrent,
+  );
   if (!entry) {
     return null;
   }
@@ -82,14 +87,15 @@ export const persistAgentStore = async (
 
 export const evictAgentStore = async (
   sessionId: string,
-  options?: { persist?: boolean },
+  options?: { persist?: boolean; isCurrent?: () => boolean },
 ): Promise<void> => {
+  const isCurrent = options?.isCurrent ?? (() => true);
   try {
     if (options?.persist !== false) {
-      await persistStore(PI_CURSOR_AGENT_CACHE_DIR, sessionId);
+      await persistStore(PI_CURSOR_AGENT_CACHE_DIR, sessionId, isCurrent);
     }
   } finally {
-    deleteStore(sessionId);
+    if (isCurrent()) deleteStore(sessionId);
   }
 };
 

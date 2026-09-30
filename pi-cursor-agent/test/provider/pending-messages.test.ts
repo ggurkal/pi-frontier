@@ -3,87 +3,20 @@ import test from "node:test";
 import type { WritableIterable } from "@connectrpc/connect/protocol";
 import {
   AgentClientMessage,
-  AgentMode,
   AgentRunRequest,
   type AgentServerMessage,
-  CancelAction,
   ClientHeartbeat,
   ConversationAction,
+  type InjectContextAction,
   ResumeAction,
-  type UserMessageAction,
 } from "../../src/__generated__/agent/v1/agent_pb.js";
-import {
-  createMessageDispatcher,
-  PendingMessageQueue,
-} from "../../src/provider/pending-messages.js";
+import { createSteerDispatcher } from "../../src/provider/pending-messages.js";
 import {
   AgentConnectClient,
+  type AgentConnectRunOptions,
   type AgentRpcClient,
 } from "../../src/vendor/agent-client/connect.js";
-
-// ---------------------------------------------------------------------------
-// PendingMessageQueue
-// ---------------------------------------------------------------------------
-
-test("PendingMessageQueue defaults to one-at-a-time", () => {
-  const q = new PendingMessageQueue();
-  assert.equal(q.mode, "one-at-a-time");
-});
-
-test("PendingMessageQueue.enqueue then drain returns one item in one-at-a-time mode", () => {
-  const q = new PendingMessageQueue("one-at-a-time");
-  q.enqueue("a");
-  q.enqueue("b");
-  q.enqueue("c");
-
-  assert.equal(q.size, 3);
-  assert.deepEqual(q.drain(), ["a"]);
-  assert.deepEqual(q.drain(), ["b"]);
-  assert.deepEqual(q.drain(), ["c"]);
-  assert.deepEqual(q.drain(), []);
-});
-
-test("PendingMessageQueue.drain returns all items in 'all' mode", () => {
-  const q = new PendingMessageQueue("all");
-  q.enqueue("a");
-  q.enqueue("b");
-  q.enqueue("c");
-
-  assert.deepEqual(q.drain(), ["a", "b", "c"]);
-  assert.equal(q.size, 0);
-  assert.deepEqual(q.drain(), []);
-});
-
-test("PendingMessageQueue.hasItems and size reflect state", () => {
-  const q = new PendingMessageQueue();
-  assert.equal(q.hasItems(), false);
-  assert.equal(q.size, 0);
-
-  q.enqueue("x");
-  assert.equal(q.hasItems(), true);
-  assert.equal(q.size, 1);
-
-  q.drain();
-  assert.equal(q.hasItems(), false);
-});
-
-test("PendingMessageQueue.clear drops everything", () => {
-  const q = new PendingMessageQueue();
-  q.enqueue("a");
-  q.enqueue("b");
-  q.clear();
-  assert.equal(q.size, 0);
-  assert.deepEqual(q.drain(), []);
-});
-
-test("PendingMessageQueue.drain on empty queue is a no-op", () => {
-  const q = new PendingMessageQueue();
-  assert.deepEqual(q.drain(), []);
-});
-
-// ---------------------------------------------------------------------------
-// MessageDispatcher
-// ---------------------------------------------------------------------------
+import { LostConnection } from "../../src/vendor/agent-client/exec-controller.js";
 
 function createMockStream() {
   const written: AgentClientMessage[] = [];
@@ -99,29 +32,29 @@ function createMockStream() {
   return { stream, written };
 }
 
-function unwrap(msg: AgentClientMessage | undefined): ConversationAction {
+function injectAction(
+  msg: AgentClientMessage | undefined,
+): InjectContextAction {
   assert.ok(msg, "expected an AgentClientMessage but got undefined");
   assert.equal(msg.message.case, "conversationAction");
-  return msg.message.value as ConversationAction;
+  const action = (msg.message.value as ConversationAction).action;
+  assert.equal(action.case, "injectContextAction");
+  return action.value as InjectContextAction;
 }
 
-function actionCases(messages: AgentClientMessage[]): string[] {
-  return messages.map((m) => unwrap(m).action.case ?? "");
+function injectedText(msg: AgentClientMessage | undefined): string {
+  const payload = injectAction(msg).payload;
+  assert.equal(payload.case, "userContext");
+  return payload.value.userMessage?.text ?? "";
 }
 
-function userText(msg: AgentClientMessage | undefined): string {
-  const action = unwrap(msg);
-  assert.equal(action.action.case, "userMessageAction");
-  return (action.action.value as UserMessageAction).userMessage?.text ?? "";
+function idAt(written: AgentClientMessage[], index: number): string {
+  return injectAction(written[index]).injectionId;
 }
 
-function ids(written: AgentClientMessage[]): string[] {
-  return written
-    .map((m) => unwrap(m))
-    .filter((a) => a.action.case === "userMessageAction")
-    .map(
-      (a) => (a.action.value as UserMessageAction).userMessage?.messageId ?? "",
-    );
+/** Let writes started by an ack finish. */
+async function settle(): Promise<void> {
+  for (let i = 0; i < 5; i++) await Promise.resolve();
 }
 
 function makeIdGen(prefix = "id"): () => string {
@@ -129,352 +62,270 @@ function makeIdGen(prefix = "id"): () => string {
   return () => `${prefix}-${n++}`;
 }
 
-test("steer() on bound stream sends CancelAction then UserMessageAction", async () => {
+function createDispatcher() {
+  return createSteerDispatcher({ runId: "run-1", generateId: makeIdGen() });
+}
+
+test("adopt writes one injectContextAction with the run id", async () => {
   const { stream, written } = createMockStream();
-  const dispatcher = createMessageDispatcher({
-    generateMessageId: makeIdGen(),
-  });
-  await dispatcher.bind(stream);
+  const steers = createDispatcher();
+  await steers.bind(stream);
 
-  await dispatcher.steer("course-correct");
+  await steers.adopt("course-correct");
 
-  assert.deepEqual(actionCases(written), ["cancelAction", "userMessageAction"]);
-  assert.ok(unwrap(written[0]).action.value instanceof CancelAction);
-  assert.equal(userText(written[1]), "course-correct");
+  assert.equal(written.length, 1);
+  const inject = injectAction(written[0]);
+  assert.equal(inject.expectedRunId, "run-1");
+  assert.ok(inject.injectionId.length > 0);
+  assert.equal(injectedText(written[0]), "course-correct");
 });
 
-test("followUp() on bound stream sends only UserMessageAction", async () => {
-  const { stream, written } = createMockStream();
-  const dispatcher = createMessageDispatcher({
-    generateMessageId: makeIdGen(),
-  });
-  await dispatcher.bind(stream);
-
-  await dispatcher.followUp("also check tests");
-
-  assert.deepEqual(actionCases(written), ["userMessageAction"]);
-  assert.equal(userText(written[0]), "also check tests");
-});
-
-test("user messages use AgentMode.AGENT and unique ids", async () => {
-  const { stream, written } = createMockStream();
-  const dispatcher = createMessageDispatcher({
-    generateMessageId: makeIdGen(),
-  });
-  await dispatcher.bind(stream);
-
-  await dispatcher.followUp("one");
-  await dispatcher.followUp("two");
-
-  for (const msg of written) {
-    const action = unwrap(msg);
-    if (action.action.case === "userMessageAction") {
-      const um = (action.action.value as UserMessageAction).userMessage;
-      assert.equal(um?.mode, AgentMode.AGENT);
-    }
-  }
-  assert.deepEqual(ids(written), ["id-0", "id-1"]);
-});
-
-test("default messageId generator produces unique uuids", async () => {
-  const { stream, written } = createMockStream();
-  const dispatcher = createMessageDispatcher();
-  await dispatcher.bind(stream);
-
-  await dispatcher.followUp("a");
-  await dispatcher.followUp("b");
-
-  const generated = ids(written);
-  assert.equal(generated.length, 2);
-  assert.notEqual(generated[0], "");
-  assert.notEqual(generated[1], "");
-  assert.notEqual(generated[0], generated[1]);
-});
-
-test("steer/followUp queue messages when unbound and flush on bind()", async () => {
-  const dispatcher = createMessageDispatcher({
-    generateMessageId: makeIdGen(),
-  });
-
-  // Not bound yet — messages just queue, no error.
-  await dispatcher.steer("steer-while-down");
-  await dispatcher.followUp("follow-while-down");
-  assert.equal(dispatcher.pendingCount(), 2);
+test("adopt before the stream binds is written on bind", async () => {
+  const steers = createDispatcher();
+  await steers.adopt("early");
 
   const { stream, written } = createMockStream();
-  await dispatcher.bind(stream);
+  await steers.bind(stream);
 
-  // Steering retry on rebind is delivered WITHOUT a fresh CancelAction
-  // (the original cancel was never sent since we were unbound; resending
-  // could unintentionally interrupt the resumed turn).
-  assert.deepEqual(actionCases(written), [
-    "userMessageAction",
-    "userMessageAction",
-  ]);
-  assert.deepEqual(written.map(userText), [
-    "steer-while-down",
-    "follow-while-down",
-  ]);
-  assert.equal(dispatcher.pendingCount(), 0);
+  assert.deepEqual(written.map(injectedText), ["early"]);
 });
 
-test("reconnect: bind() with a new stream redelivers pending messages", async () => {
-  const dispatcher = createMessageDispatcher({
-    generateMessageId: makeIdGen(),
-  });
+test("a delivered steer is not owed", async () => {
+  const { stream, written } = createMockStream();
+  const steers = createDispatcher();
+  await steers.bind(stream);
+  await steers.adopt("s1");
 
+  steers.applyAck(idAt(written, 0), "queued");
+  steers.applyAck(idAt(written, 0), "delivered");
+
+  assert.deepEqual(steers.settle(), []);
+});
+
+for (const state of ["rejected", "cancelled", "queuedForNextTurn"] as const) {
+  test(`a ${state} steer is owed`, async () => {
+    const { stream, written } = createMockStream();
+    const steers = createDispatcher();
+    await steers.bind(stream);
+    await steers.adopt("s1");
+
+    steers.applyAck(idAt(written, 0), state);
+
+    assert.deepEqual(steers.settle(), ["s1"]);
+  });
+}
+
+test("one injection is in flight at a time", async () => {
+  const { stream, written } = createMockStream();
+  const steers = createDispatcher();
+  await steers.bind(stream);
+  await steers.adopt("s1");
+  await steers.adopt("s2");
+  assert.deepEqual(written.map(injectedText), ["s1"]);
+
+  steers.applyAck(idAt(written, 0), "queued");
+  assert.equal(written.length, 1);
+  steers.applyAck(idAt(written, 0), "delivered");
+  await settle();
+
+  assert.deepEqual(written.map(injectedText), ["s1", "s2"]);
+});
+
+test("the first undelivered steer stops injection; the rest are owed in order", async () => {
+  const { stream, written } = createMockStream();
+  const steers = createDispatcher();
+  await steers.bind(stream);
+  await steers.adopt("s1");
+  await steers.adopt("s2");
+  await steers.adopt("s3");
+  steers.applyAck(idAt(written, 0), "delivered");
+  await settle();
+
+  steers.applyAck(idAt(written, 1), "rejected");
+  await settle();
+
+  assert.equal(written.length, 2);
+  assert.deepEqual(steers.settle(), ["s2", "s3"]);
+});
+
+test("queuedForNextTurn stops later injections; they are owed", async () => {
+  const { stream, written } = createMockStream();
+  const steers = createDispatcher();
+  await steers.bind(stream);
+  await steers.adopt("s1");
+  steers.applyAck(idAt(written, 0), "queuedForNextTurn");
+
+  await steers.adopt("s2");
+
+  assert.equal(written.length, 1);
+  assert.deepEqual(steers.settle(), ["s1", "s2"]);
+});
+
+test("identical texts are tracked per injection", async () => {
+  const { stream, written } = createMockStream();
+  const steers = createDispatcher();
+  await steers.bind(stream);
+  await steers.adopt("same");
+  await steers.adopt("same");
+
+  steers.applyAck(idAt(written, 0), "delivered");
+  await settle();
+  steers.applyAck(idAt(written, 1), "rejected");
+
+  assert.equal(written.length, 2);
+  assert.deepEqual(steers.settle(), ["same"]);
+});
+
+test("settle treats unacked injections as undelivered and runs once", async () => {
+  const { stream, written } = createMockStream();
+  const steers = createDispatcher();
+  await steers.bind(stream);
+  await steers.adopt("queued");
+  await steers.adopt("waiting");
+  steers.applyAck(idAt(written, 0), "queued");
+
+  assert.deepEqual(steers.settle(), ["queued", "waiting"]);
+  assert.deepEqual(steers.settle(), []);
+});
+
+test("acks and adopts after settle change nothing", async () => {
+  const { stream, written } = createMockStream();
+  const steers = createDispatcher();
+  await steers.bind(stream);
+  await steers.adopt("s1");
+
+  assert.deepEqual(steers.settle(), ["s1"]);
+  steers.applyAck(idAt(written, 0), "delivered");
+  await steers.adopt("late");
+  assert.equal(written.length, 1);
+  assert.deepEqual(steers.settle(), []);
+});
+
+test("a rebind keeps an open injection open for a late ack", async () => {
   const a = createMockStream();
-  await dispatcher.bind(a.stream);
-  await dispatcher.steer("first");
-  assert.deepEqual(actionCases(a.written), [
-    "cancelAction",
-    "userMessageAction",
-  ]);
-  const firstSteerId = ids(a.written)[0];
-  if (firstSteerId) {
-    dispatcher.ackUserMessage(firstSteerId);
-  }
-
-  // Simulate disconnect: unbind, then user steers again while down.
-  dispatcher.unbind();
-  await dispatcher.steer("during-outage");
-  await dispatcher.followUp("queued-followup");
-  assert.equal(a.written.length, 2); // nothing more on the old stream
-  assert.equal(dispatcher.pendingCount(), 2);
-
-  // Reconnect with a new stream.
-  const b = createMockStream();
-  await dispatcher.bind(b.stream);
-
-  // No fresh cancel on rebind — both queued messages arrive as plain user
-  // messages on the new stream.
-  assert.deepEqual(actionCases(b.written), [
-    "userMessageAction",
-    "userMessageAction",
-  ]);
-  assert.deepEqual(b.written.map(userText), [
-    "during-outage",
-    "queued-followup",
-  ]);
-  assert.equal(dispatcher.pendingCount(), 0);
-});
-
-test("reconnect replays unacked steer messages", async () => {
-  const dispatcher = createMessageDispatcher({
-    generateMessageId: makeIdGen(),
-  });
-
-  const a = createMockStream();
-  await dispatcher.bind(a.stream);
-  await dispatcher.steer("replay-me");
-  assert.deepEqual(actionCases(a.written), [
-    "cancelAction",
-    "userMessageAction",
-  ]);
-
-  // Rebinding without ACK should replay the optimistic steer.
-  const b = createMockStream();
-  await dispatcher.bind(b.stream);
-
-  assert.deepEqual(actionCases(b.written), ["userMessageAction"]);
-  assert.equal(userText(b.written[0]), "replay-me");
-});
-
-test("reconnect does not replay acked steer messages", async () => {
-  const dispatcher = createMessageDispatcher({
-    generateMessageId: makeIdGen(),
-  });
-
-  const a = createMockStream();
-  await dispatcher.bind(a.stream);
-  await dispatcher.steer("already-applied");
-  const sentIds = ids(a.written);
-  if (sentIds[0]) {
-    dispatcher.ackUserMessage(sentIds[0]);
-  }
+  const steers = createDispatcher();
+  await steers.bind(a.stream);
+  await steers.adopt("s1");
+  await steers.adopt("s2");
+  steers.applyAck(idAt(a.written, 0), "queued");
 
   const b = createMockStream();
-  await dispatcher.bind(b.stream);
-
+  await steers.bind(b.stream);
   assert.equal(b.written.length, 0);
+
+  steers.applyAck(idAt(a.written, 0), "delivered");
+  await settle();
+  assert.deepEqual(b.written.map(injectedText), ["s2"]);
 });
 
-test("multiple reconnects flush only what is still queued", async () => {
-  const dispatcher = createMessageDispatcher({
-    generateMessageId: makeIdGen(),
-  });
-
-  // First connect: deliver one followUp.
+test("a rebind resends steers delivered after the last checkpoint, in order", async () => {
   const a = createMockStream();
-  await dispatcher.bind(a.stream);
-  await dispatcher.followUp("delivered");
-  assert.equal(a.written.length, 1);
+  const steers = createDispatcher();
+  await steers.bind(a.stream);
+  await steers.adopt("committed");
+  steers.applyAck(idAt(a.written, 0), "delivered");
+  steers.commit();
+  await steers.adopt("uncommitted");
+  steers.applyAck(idAt(a.written, 1), "delivered");
+  await steers.adopt("in flight");
+  await settle();
+  assert.equal(a.written.length, 3);
 
-  // Disconnect + reconnect with nothing pending: no writes.
-  dispatcher.unbind();
   const b = createMockStream();
-  await dispatcher.bind(b.stream);
-  assert.equal(b.written.length, 0);
+  await steers.bind(b.stream);
+  assert.deepEqual(b.written.map(injectedText), ["uncommitted"]);
+  steers.applyAck(idAt(a.written, 2), "delivered");
+  assert.equal(b.written.length, 1);
+
+  steers.applyAck(idAt(b.written, 0), "delivered");
+  await settle();
+  assert.deepEqual(b.written.map(injectedText), ["uncommitted", "in flight"]);
+  steers.applyAck(idAt(b.written, 1), "delivered");
+  assert.deepEqual(steers.settle(), []);
 });
 
-test("steer() and followUp() reject after close()", async () => {
-  const { stream } = createMockStream();
-  const dispatcher = createMessageDispatcher();
-  await dispatcher.bind(stream);
-  dispatcher.close();
-
-  await assert.rejects(
-    () => dispatcher.steer("x"),
-    /MessageDispatcher is closed/,
-  );
-  await assert.rejects(
-    () => dispatcher.followUp("x"),
-    /MessageDispatcher is closed/,
-  );
-});
-
-test("close() drops pending messages", async () => {
-  const dispatcher = createMessageDispatcher();
-  await dispatcher.steer("queued");
-  await dispatcher.followUp("queued");
-  assert.equal(dispatcher.pendingCount(), 2);
-
-  dispatcher.close();
-  assert.equal(dispatcher.pendingCount(), 0);
-});
-
-test("close() is idempotent", () => {
-  const dispatcher = createMessageDispatcher();
-  dispatcher.close();
-  dispatcher.close();
-});
-
-test("bind() after close() throws", async () => {
-  const { stream } = createMockStream();
-  const dispatcher = createMessageDispatcher();
-  dispatcher.close();
-
-  await assert.rejects(
-    () => dispatcher.bind(stream),
-    /MessageDispatcher is closed/,
-  );
-});
-
-test("interleaved steer/followUp on bound stream produce correct wire pattern", async () => {
-  const { stream, written } = createMockStream();
-  const dispatcher = createMessageDispatcher({
-    generateMessageId: makeIdGen(),
-  });
-  await dispatcher.bind(stream);
-
-  await dispatcher.steer("s1");
-  await dispatcher.followUp("f1");
-  await dispatcher.steer("s2");
-
-  assert.deepEqual(actionCases(written), [
-    "cancelAction",
-    "userMessageAction",
-    "userMessageAction",
-    "cancelAction",
-    "userMessageAction",
-  ]);
-});
-
-test("if cancel write throws, the queued user message is still delivered", async () => {
-  // Stream that only fails the first write (the cancel), then succeeds.
-  const written: AgentClientMessage[] = [];
-  let writes = 0;
-  const stream: WritableIterable<AgentClientMessage> = {
-    write: async (msg: AgentClientMessage) => {
-      writes++;
-      if (writes === 1) {
-        throw new Error("simulated cancel failure");
-      }
-      written.push(msg);
-    },
-    [Symbol.asyncIterator]: () => {
-      throw new Error("not used");
-    },
-    close: () => {},
-  };
-
-  const dispatcher = createMessageDispatcher({
-    generateMessageId: makeIdGen(),
-  });
-  await dispatcher.bind(stream);
-
-  // Should NOT reject — cancel failure is swallowed.
-  await dispatcher.steer("still-arrives");
-
-  // The cancel was dropped but the user message landed.
-  assert.deepEqual(actionCases(written), ["userMessageAction"]);
-  assert.equal(userText(written[0]), "still-arrives");
-});
-
-test("if userMessage write throws, message is requeued and redelivered on next bind()", async () => {
-  const failingStream: WritableIterable<AgentClientMessage> = {
+test("a failed write stays pending and is sent on the next bind", async () => {
+  const failing: WritableIterable<AgentClientMessage> = {
     write: async () => {
-      throw new Error("simulated message write failure");
+      throw new Error("simulated inject failure");
     },
     [Symbol.asyncIterator]: () => {
       throw new Error("not used");
     },
     close: () => {},
   };
-
-  const dispatcher = createMessageDispatcher({
-    generateMessageId: makeIdGen(),
-  });
-  await dispatcher.bind(failingStream);
-
-  // Best-effort send: failed write should not reject and should remain queued.
-  await dispatcher.followUp("retry-me");
-  assert.equal(dispatcher.pendingCount(), 1);
+  const steers = createDispatcher();
+  await steers.bind(failing);
+  await steers.adopt("a");
+  await steers.adopt("b");
 
   const healthy = createMockStream();
-  await dispatcher.bind(healthy.stream);
+  await steers.bind(healthy.stream);
+  assert.deepEqual(healthy.written.map(injectedText), ["a"]);
 
-  assert.deepEqual(actionCases(healthy.written), ["userMessageAction"]);
-  assert.equal(userText(healthy.written[0]), "retry-me");
-  assert.equal(dispatcher.pendingCount(), 0);
+  steers.applyAck(idAt(healthy.written, 0), "delivered");
+  await settle();
+  assert.deepEqual(healthy.written.map(injectedText), ["a", "b"]);
 });
 
-test("requeue preserves order for remaining batch items in 'all' mode", async () => {
-  let writes = 0;
-  const written: AgentClientMessage[] = [];
-  const flakyStream: WritableIterable<AgentClientMessage> = {
-    write: async (msg: AgentClientMessage) => {
-      writes++;
-      if (writes === 2) {
-        throw new Error("fail on second write");
-      }
-      written.push(msg);
-    },
+test("a rebind replays a delivered steer even after a later one failed", async () => {
+  const a = createMockStream();
+  const steers = createDispatcher();
+  await steers.bind(a.stream);
+  steers.commit();
+  await steers.adopt("s1");
+  steers.applyAck(idAt(a.written, 0), "delivered");
+  await settle();
+  await steers.adopt("s2");
+  steers.applyAck(idAt(a.written, 1), "rejected");
+
+  const b = createMockStream();
+  await steers.bind(b.stream);
+  assert.deepEqual(b.written.map(injectedText), ["s1"]);
+
+  steers.applyAck(idAt(b.written, 0), "delivered");
+  await settle();
+  assert.equal(b.written.length, 1);
+  assert.deepEqual(steers.settle(), ["s2"]);
+});
+
+test("a write that fails after a rebind is resent on the new stream", async () => {
+  let rejectWrite: ((error: Error) => void) | undefined;
+  const stale: WritableIterable<AgentClientMessage> = {
+    write: () =>
+      new Promise<void>((_, reject) => {
+        rejectWrite = reject;
+      }),
     [Symbol.asyncIterator]: () => {
       throw new Error("not used");
     },
     close: () => {},
   };
+  const steers = createDispatcher();
+  await steers.bind(stale);
+  const adopted = steers.adopt("s1");
 
-  const dispatcher = createMessageDispatcher({
-    generateMessageId: makeIdGen(),
-    mode: "all",
-  });
+  const fresh = createMockStream();
+  await steers.bind(fresh.stream);
+  assert.equal(fresh.written.length, 0);
+  rejectWrite?.(new Error("stream closed"));
+  await adopted;
 
-  await dispatcher.followUp("a");
-  await dispatcher.followUp("b");
-  await dispatcher.followUp("c");
-  assert.equal(dispatcher.pendingCount(), 3);
-
-  await dispatcher.bind(flakyStream);
-  assert.deepEqual(written.map(userText), ["a"]);
-  assert.equal(dispatcher.pendingCount(), 2);
-
-  const healthy = createMockStream();
-  await dispatcher.bind(healthy.stream);
-  assert.deepEqual(healthy.written.map(userText), ["b", "c"]);
-  assert.equal(dispatcher.pendingCount(), 0);
+  assert.deepEqual(fresh.written.map(injectedText), ["s1"]);
 });
+
+test("adopt after close is owed; bind after close throws", async () => {
+  const steers = createDispatcher();
+  steers.close();
+
+  await steers.adopt("y");
+  await assert.rejects(steers.bind(createMockStream().stream), /closed/);
+  assert.deepEqual(steers.settle(), ["y"]);
+});
+
+// ---------------------------------------------------------------------------
+// AgentConnectClient
+// ---------------------------------------------------------------------------
 
 function createInitialRunRequest(): AgentClientMessage {
   return new AgentClientMessage({
@@ -491,6 +342,24 @@ function createInitialRunRequest(): AgentClientMessage {
 
 function createEmptyServerStream(): AsyncIterable<AgentServerMessage> {
   return (async function* () {})();
+}
+
+function baseRunOptions(): AgentConnectRunOptions {
+  return {
+    interactionListener: {
+      sendUpdate: async () => {},
+      query: async () => ({ approved: false, reason: "not used in this test" }),
+    },
+    resources: { entries: () => [] },
+    blobStore: {
+      getBlob: async () => undefined,
+      setBlob: async () => {},
+    },
+    checkpointHandler: {
+      handleCheckpoint: async () => {},
+      getLatestCheckpoint: () => undefined,
+    },
+  };
 }
 
 test("onRequestStreamCreated writes cannot overtake initial runRequest", async () => {
@@ -522,19 +391,7 @@ test("onRequestStreamCreated writes cannot overtake initial runRequest", async (
   const client = new AgentConnectClient(rpcClient);
 
   await client.run(createInitialRunRequest(), {
-    interactionListener: {
-      sendUpdate: async () => {},
-      query: async () => ({ approved: false, reason: "not used in this test" }),
-    },
-    resources: { entries: () => [] },
-    blobStore: {
-      getBlob: async () => undefined,
-      setBlob: async () => {},
-    },
-    checkpointHandler: {
-      handleCheckpoint: async () => {},
-      getLatestCheckpoint: () => undefined,
-    },
+    ...baseRunOptions(),
     onRequestStreamCreated: (stream) => {
       void stream.write(
         new AgentClientMessage({
@@ -551,4 +408,32 @@ test("onRequestStreamCreated writes cannot overtake initial runRequest", async (
   assert.equal(captured.length, 2);
   assert.equal(captured[0]?.message.case, "runRequest");
   assert.equal(captured[1]?.message.case, "clientHeartbeat");
+});
+
+test("retries keep x-original-request-id and get a fresh x-request-id", async () => {
+  const seen: Array<Record<string, string> | undefined> = [];
+  const rpcClient: AgentRpcClient = {
+    run(_input, options) {
+      seen.push(options?.headers);
+      if (seen.length === 1) {
+        return {
+          [Symbol.asyncIterator]: () => ({
+            next: () => Promise.reject(new LostConnection("simulated drop")),
+          }),
+        };
+      }
+      return createEmptyServerStream();
+    },
+  };
+
+  const client = new AgentConnectClient(rpcClient);
+  await client.run(createInitialRunRequest(), {
+    ...baseRunOptions(),
+    headers: { "x-request-id": "gen-1", "x-original-request-id": "gen-1" },
+  });
+
+  assert.equal(seen.length, 2);
+  assert.equal(seen[0]?.["x-request-id"], "gen-1");
+  assert.equal(seen[1]?.["x-original-request-id"], "gen-1");
+  assert.notEqual(seen[1]?.["x-request-id"], "gen-1");
 });

@@ -25,12 +25,7 @@ import {
   updateSkipApprovalStatus,
 } from "./lib/skip-approval";
 import { restoreAgentStoreFromBranch } from "./provider/agent-store";
-import {
-  getLiveSession,
-  queueInputIntent,
-  toStreamingBehavior,
-} from "./provider/agent-stream-hook";
-import { routeStreamingInputToLiveSession } from "./provider/input-routing";
+import { getLiveSession } from "./provider/agent-stream-hook";
 import {
   getCachedPiModels,
   updateCachedPiModelsIfStale,
@@ -193,40 +188,13 @@ export default (pi: ExtensionAPI) => {
     updateSkipApprovalStatus(ctx);
   });
 
-  pi.on("input", async (event, ctx) => {
+  // Pi's loop is over, so no streamSimple call will reattach. A run still
+  // registered here would replay into the next prompt.
+  pi.on("agent_end", async (_event, ctx) => {
     const sessionId = ctx.sessionManager.getSessionId();
-    const liveSession = getLiveSession(sessionId);
-    const source = (event as { source?: unknown }).source;
-    const streamingBehavior = toStreamingBehavior(
-      (event as { streamingBehavior?: unknown; deliverAs?: unknown })
-        .streamingBehavior ??
-        (event as { streamingBehavior?: unknown; deliverAs?: unknown })
-          .deliverAs,
-    );
-    const text = (event as { text?: unknown }).text;
-    if (
-      source === "interactive" &&
-      streamingBehavior &&
-      typeof text === "string" &&
-      text.trim().length > 0
-    ) {
-      if (liveSession) {
-        try {
-          if (streamingBehavior === "steer") {
-            liveSession.markSteerIntent?.();
-            await liveSession.steer(text);
-          } else {
-            await liveSession.followUp(text);
-          }
-        } catch {
-          queueInputIntent(sessionId, text, streamingBehavior);
-        }
-      } else {
-        queueInputIntent(sessionId, text, streamingBehavior);
-      }
+    if (getLiveSession(sessionId)) {
+      await terminateSession(sessionId, "Session ended");
     }
-    const action = await routeStreamingInputToLiveSession(event, liveSession);
-    return { action };
   });
 
   pi.on("tool_execution_end", async (event) => {

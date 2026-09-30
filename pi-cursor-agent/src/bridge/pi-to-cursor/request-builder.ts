@@ -122,15 +122,6 @@ function buildConversationTurns(
       continue;
     }
 
-    let isLastUserMessage = true;
-    for (let j = i + 1; j < messages.length; j++) {
-      if (messages[j]?.role === "user") {
-        isLastUserMessage = false;
-        break;
-      }
-    }
-    if (isLastUserMessage) break;
-
     const userText = extractUserMessageText(msg);
     if (!userText) {
       i++;
@@ -235,6 +226,11 @@ interface BuildRunRequestParams {
   mcpToolDefinitions?: McpToolDefinition[];
   state?: CursorStateStore;
   systemPromptOverride?: string;
+  /**
+   * The run action. Defaults to the user messages at the end of the context,
+   * which are never also rebuilt as history turns.
+   */
+  userText?: string;
 }
 
 interface BuildRunRequestResult {
@@ -258,8 +254,18 @@ export function buildRunRequest(
   const systemPromptId = getBlobId(systemPromptBytes);
   void params.blobStore.setBlob(null, systemPromptId, systemPromptBytes);
 
-  const lastMessage = params.context.messages.at(-1);
-  const userText = lastMessage ? extractUserMessageText(lastMessage) : "";
+  const messages = params.context.messages;
+  let pendingStart = messages.length;
+  while (pendingStart > 0 && messages[pendingStart - 1]?.role === "user") {
+    pendingStart--;
+  }
+  const userText =
+    params.userText ??
+    messages
+      .slice(pendingStart)
+      .map(extractUserMessageText)
+      .filter((text) => text.length > 0)
+      .join("\n\n");
   if (!userText) {
     throw new Error("Cannot send empty user message to Cursor API");
   }
@@ -278,7 +284,7 @@ export function buildRunRequest(
 
   const cached = params.conversationState;
   const turns = buildConversationTurns(
-    params.context.messages,
+    messages.slice(0, pendingStart),
     params.blobStore,
     params.state,
   );

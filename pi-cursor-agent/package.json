@@ -31,7 +31,7 @@
     "lint": "biome check",
     "format": "biome check --write",
     "typecheck": "tsc",
-    "test": "tsx --test $(find test -name '*.test.ts' -o -name '*.test.mts' -o -name '*.test.js' | sort)",
+    "test": "tsx --test --test-timeout=30000 $(find test -name '*.test.ts' -o -name '*.test.mts' -o -name '*.test.js' | sort)",
     "proto:generate": "buf generate"
   },
   "dependencies": {

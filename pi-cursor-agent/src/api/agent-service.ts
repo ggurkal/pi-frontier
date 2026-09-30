@@ -108,7 +108,9 @@ class AgentService {
       req.header.set("x-cursor-client-type", options.clientType);
       req.header.set("x-cursor-client-version", options.clientVersion);
       req.header.set("x-ghost-mode", "true");
-      req.header.set("x-request-id", crypto.randomUUID());
+      if (!req.header.has("x-request-id")) {
+        req.header.set("x-request-id", crypto.randomUUID());
+      }
       return next(req);
     };
 

@@ -199,3 +199,27 @@ test("reconstruction works without state", () => {
 
   assert.equal(buildRunRequest(params).conversationState.turns.length, 1);
 });
+
+test("trailing user messages are the action, not history turns", () => {
+  const { params } = createParams({
+    messages: [
+      { role: "user", content: "Hi", timestamp: 1 },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "Hello!" }],
+        timestamp: 2,
+        ...ASSISTANT_DEFAULTS,
+      },
+      { role: "user", content: "first", timestamp: 3 },
+      { role: "user", content: "second", timestamp: 4 },
+    ],
+  });
+
+  const result = buildRunRequest(params);
+  assert.equal(result.conversationState.turns.length, 1);
+  const request = result.initialRequest.message;
+  assert.equal(request.case, "runRequest");
+  const action = request.value.action?.action;
+  assert.equal(action?.case, "userMessageAction");
+  assert.equal(action.value.userMessage?.text, "first\n\nsecond");
+});

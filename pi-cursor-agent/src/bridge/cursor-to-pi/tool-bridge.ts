@@ -14,6 +14,7 @@ export interface ToolExecRequest {
 
 interface PendingResult {
   sessionId: string;
+  channel: LiveEventChannel | null;
   resolve: (result: ToolResultMessage) => void;
   reject: (error: Error) => void;
 }
@@ -25,8 +26,17 @@ export function requestToolExecution(
   request: ToolExecRequest,
 ): Promise<ToolResultMessage> {
   return new Promise<ToolResultMessage>((resolve, reject) => {
+    if (channel?.isDone) {
+      reject(new Error("Tool bridge not available — run has ended"));
+      return;
+    }
     const sessionId = channel?.sessionId ?? "";
-    pendingResults.set(request.toolCallId, { sessionId, resolve, reject });
+    pendingResults.set(request.toolCallId, {
+      sessionId,
+      channel,
+      resolve,
+      reject,
+    });
 
     if (channel) {
       channel.push({ kind: "tool-exec-request", request });
@@ -51,6 +61,19 @@ export function rejectPendingForSession(
 ): void {
   for (const [id, pending] of pendingResults) {
     if (pending.sessionId === sessionId) {
+      pending.reject(new Error(reason));
+      pendingResults.delete(id);
+    }
+  }
+}
+
+/** Reject the pending tool requests of one run, identified by its channel. */
+export function rejectPendingForChannel(
+  channel: LiveEventChannel,
+  reason: string,
+): void {
+  for (const [id, pending] of pendingResults) {
+    if (pending.channel === channel) {
       pending.reject(new Error(reason));
       pendingResults.delete(id);
     }
