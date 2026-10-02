@@ -184,6 +184,7 @@ function createInteractionListenerAdapter(
         case "web-fetch-request":
         case "exa-search-request":
         case "exa-fetch-request":
+          return { approved: true };
         case "switch-mode-request":
           return { approved: false, reason: QUERY_REJECTION_REASON };
         case "create-plan-request":
