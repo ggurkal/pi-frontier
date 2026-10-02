@@ -10,6 +10,7 @@ import type {
 } from "../__generated__/agent/v1/agent_pb";
 import { AgentService as AgentServiceDef } from "../__generated__/agent/v1/agent_service_connect";
 import type { AgentRpcClient } from "../vendor/agent-client";
+import { EagerHttp2SessionManager } from "./eager-http2-session-manager";
 
 interface AgentServiceOptions {
   accessToken: string;
@@ -118,6 +119,8 @@ class AgentService {
       baseUrl,
       httpVersion: "2",
       interceptors: [authInterceptor],
+      // Bun workaround; see EagerHttp2SessionManager.
+      sessionManager: new EagerHttp2SessionManager(baseUrl),
     });
 
     this.client = createClient(AgentServiceDef, transport);
