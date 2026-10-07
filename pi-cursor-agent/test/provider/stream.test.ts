@@ -23,6 +23,7 @@ import {
   ContextInjectionStateUpdate,
   type ConversationAction,
   ConversationStateStructure,
+  HeartbeatUpdate,
   type InjectContextAction,
   InteractionUpdate,
   TextDeltaUpdate,
@@ -210,9 +211,25 @@ class FakeRun {
     );
   }
 
-  end(): void {
+  /** Ends the response like Cursor does, after a `turnEnded` update. */
+  end(options: { turnEnded?: boolean } = {}): void {
+    if (
+      options.turnEnded !== false &&
+      !this.ended &&
+      this.failure === undefined
+    ) {
+      this.turnEnded();
+    }
     this.ended = true;
     this.wake?.();
+  }
+
+  heartbeat(): void {
+    this.sendUpdate(
+      new InteractionUpdate({
+        message: { case: "heartbeat", value: new HeartbeatUpdate() },
+      }),
+    );
   }
 
   fail(error: unknown): void {
@@ -289,6 +306,7 @@ before(async () => {
       return run.stream();
     },
   }));
+  streamModule.setConnectTimings({ backoffMs: () => 0, stallThresholdMs: 0 });
 });
 
 afterEach(() => {
@@ -301,6 +319,7 @@ afterEach(() => {
 
 after(async () => {
   streamModule.setAgentRpcClientFactory(undefined);
+  streamModule.setConnectTimings(undefined);
   await fs.rm(cacheDir, { recursive: true, force: true });
 });
 

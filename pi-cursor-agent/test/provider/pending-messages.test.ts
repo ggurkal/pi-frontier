@@ -4,11 +4,13 @@ import type { WritableIterable } from "@connectrpc/connect/protocol";
 import {
   AgentClientMessage,
   AgentRunRequest,
-  type AgentServerMessage,
+  AgentServerMessage,
   ClientHeartbeat,
   ConversationAction,
   type InjectContextAction,
+  InteractionUpdate,
   ResumeAction,
+  TurnEndedUpdate,
 } from "../../src/__generated__/agent/v1/agent_pb.js";
 import { createSteerDispatcher } from "../../src/provider/pending-messages.js";
 import {
@@ -340,8 +342,17 @@ function createInitialRunRequest(): AgentClientMessage {
   });
 }
 
-function createEmptyServerStream(): AsyncIterable<AgentServerMessage> {
-  return (async function* () {})();
+function createTurnEndedServerStream(): AsyncIterable<AgentServerMessage> {
+  return (async function* () {
+    yield new AgentServerMessage({
+      message: {
+        case: "interactionUpdate",
+        value: new InteractionUpdate({
+          message: { case: "turnEnded", value: new TurnEndedUpdate() },
+        }),
+      },
+    });
+  })();
 }
 
 function baseRunOptions(): AgentConnectRunOptions {
@@ -384,7 +395,7 @@ test("onRequestStreamCreated writes cannot overtake initial runRequest", async (
         }
       })();
 
-      return createEmptyServerStream();
+      return createTurnEndedServerStream();
     },
   };
 
@@ -422,13 +433,14 @@ test("retries keep x-original-request-id and get a fresh x-request-id", async ()
           }),
         };
       }
-      return createEmptyServerStream();
+      return createTurnEndedServerStream();
     },
   };
 
   const client = new AgentConnectClient(rpcClient);
   await client.run(createInitialRunRequest(), {
     ...baseRunOptions(),
+    backoffMs: () => 0,
     headers: { "x-request-id": "gen-1", "x-original-request-id": "gen-1" },
   });
 

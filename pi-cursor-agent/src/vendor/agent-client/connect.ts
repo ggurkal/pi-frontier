@@ -62,6 +62,8 @@ export interface AgentConnectRunOptions {
   onRequestStreamCreated?: (
     stream: WritableIterable<AgentClientMessage>,
   ) => void;
+  /** Delay before retry `attempt` (1-based). */
+  backoffMs?: (attempt: number) => number;
 }
 
 const HEARTBEAT_INTERVAL_MS = 5_000;
@@ -97,8 +99,12 @@ function attemptHeaders(
   return { headers: { ...headers, "x-request-id": crypto.randomUUID() } };
 }
 
-async function backoff(attempt: number, signal?: AbortSignal): Promise<void> {
-  const delay = Math.min(1_000 * 2 ** attempt, 30_000);
+async function backoff(
+  attempt: number,
+  signal?: AbortSignal,
+  backoffMs?: (attempt: number) => number,
+): Promise<void> {
+  const delay = backoffMs?.(attempt) ?? Math.min(1_000 * 2 ** attempt, 30_000);
   return new Promise<void>((resolve) => {
     const timer = setTimeout(resolve, delay);
     signal?.addEventListener(
@@ -207,7 +213,7 @@ export class AgentConnectClient {
         maybeResumeFromCheckpoint();
 
         attempt++;
-        await backoff(attempt, options.signal);
+        await backoff(attempt, options.signal, options.backoffMs);
       }
     }
   }

@@ -564,6 +564,18 @@ export function setAgentRpcClientFactory(
   createAgentRpcClient = factory ?? defaultAgentRpcClientFactory;
 }
 
+interface ConnectTimings {
+  stallThresholdMs?: number;
+  backoffMs?: (attempt: number) => number;
+}
+
+let connectTimings: ConnectTimings = {};
+
+/** Test seam: stall threshold and retry backoff. Pass `undefined` to restore. */
+export function setConnectTimings(timings: ConnectTimings | undefined): void {
+  connectTimings = timings ?? {};
+}
+
 interface StartLiveSessionParams {
   pi: ExtensionAPI;
   getCtx: () => ExtensionContext | null;
@@ -744,6 +756,9 @@ async function startRun(
     agentStore.getConversationStateStructure();
 
   const runOptions: Parameters<typeof connectClient.run>[1] = {
+    ...(connectTimings.backoffMs
+      ? { backoffMs: connectTimings.backoffMs }
+      : {}),
     interactionListener,
     resources,
     blobStore,
