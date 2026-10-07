@@ -12,18 +12,15 @@ import type {
 import type { KvServerMessage } from "../../__generated__/agent/v1/kv_pb";
 import { StreamEndedWithoutTurnEndedError } from "./retry-policy";
 import type { RunProgress } from "./run-progress";
+import type { StallDetector } from "./stall-detector";
+
+export type { StallDetector } from "./stall-detector";
 
 export type InteractionMessage =
   | { case: "interactionUpdate"; value: InteractionUpdate }
   | { case: "interactionQuery"; value: InteractionQuery };
 
 export type ExecMessage = ExecServerMessage | ExecServerControlMessage;
-
-export interface StallDetector {
-  onServerSentHeartbeat(): void;
-  reset(activityType: string, messageType: string): void;
-  onStreamEnded(): void;
-}
 
 export interface SplitChannels {
   interactionStream: AsyncIterable<InteractionMessage>;

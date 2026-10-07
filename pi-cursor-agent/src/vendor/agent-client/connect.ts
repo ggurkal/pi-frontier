@@ -33,6 +33,7 @@ import {
   type InteractionListener,
 } from "./interaction-controller";
 import {
+  ConnectionStalledError,
   decideRetry,
   type FailureKind,
   isTransportError,
@@ -42,11 +43,12 @@ import {
   type StallInfo,
 } from "./retry-policy";
 import { RunProgress } from "./run-progress";
+import { type SplitChannels, splitStream } from "./split-stream";
 import {
-  type SplitChannels,
+  createStallDetector,
+  STALL_THRESHOLD_MS,
   type StallDetector,
-  splitStream,
-} from "./split-stream";
+} from "./stall-detector";
 
 export interface AgentRpcClient {
   run(
@@ -74,6 +76,8 @@ export interface AgentConnectRunOptions {
   onRequestStreamCreated?: (
     stream: WritableIterable<AgentClientMessage>,
   ) => void;
+  /** No inbound message for this long aborts the attempt; `<= 0` disables. */
+  stallThresholdMs?: number;
   /** Delay before retry `attempt` (1-based). */
   backoffMs?: (attempt: number) => number;
   /** Every transport or stall failure and the decision taken, before acting on it. */
@@ -93,11 +97,45 @@ export interface AttemptFailure {
 const HEARTBEAT_INTERVAL_MS = 5_000;
 export const ORIGINAL_REQUEST_ID_HEADER = "x-original-request-id";
 
-function createNoopStallDetector(): StallDetector {
+interface AttemptControl {
+  /** Aborts when the session aborts or the attempt stalls. */
+  signal: AbortSignal;
+  detector: StallDetector;
+  readonly stalled: boolean;
+  readonly stallInfo: StallInfo | undefined;
+  dispose(): void;
+}
+
+function createAttemptControl(
+  sessionSignal: AbortSignal | undefined,
+  thresholdMs: number,
+): AttemptControl {
+  const controller = new AbortController();
+  const onSessionAbort = () => controller.abort(sessionSignal?.reason);
+  if (sessionSignal?.aborted) onSessionAbort();
+  else sessionSignal?.addEventListener("abort", onSessionAbort, { once: true });
+
+  let stallInfo: StallInfo | undefined;
+  const detector = createStallDetector({
+    thresholdMs,
+    onStall: (info) => {
+      stallInfo = info;
+      controller.abort(new ConnectionStalledError(info));
+    },
+  });
   return {
-    onServerSentHeartbeat() {},
-    reset() {},
-    onStreamEnded() {},
+    signal: controller.signal,
+    detector,
+    get stalled() {
+      return stallInfo !== undefined;
+    },
+    get stallInfo() {
+      return stallInfo;
+    },
+    dispose() {
+      detector.dispose();
+      sessionSignal?.removeEventListener("abort", onSessionAbort);
+    },
   };
 }
 
@@ -168,12 +206,17 @@ export class AgentConnectClient {
     const progress = new RunProgress();
     let attempt = 0;
     let noProgressResumes = 0;
+    let stallRetryStartedAt: number | undefined;
 
     while (true) {
       if (options.signal?.aborted) {
         throw new Error("Request cancelled");
       }
       progress.startAttempt();
+      const attemptControl = createAttemptControl(
+        options.signal,
+        options.stallThresholdMs ?? STALL_THRESHOLD_MS,
+      );
 
       try {
         const request = this.buildRequest(
@@ -188,12 +231,18 @@ export class AgentConnectClient {
           request,
           { ...options, ...attemptHeaders(options.headers, attempt) },
           progress,
+          attemptControl,
         );
         return;
       } catch (error) {
         if (options.signal?.aborted) throw error;
-        if (!isTransportError(error, progress.turnEnded)) throw error;
-        const kind: FailureKind = "transport";
+        const kind: FailureKind | undefined = attemptControl.stalled
+          ? "stall"
+          : isTransportError(error, progress.turnEnded)
+            ? "transport"
+            : undefined;
+        if (!kind) throw error;
+        const stall = attemptControl.stallInfo;
 
         const snapshot = progress.snapshot();
         const actionIsResume = currentAction.action.case === "resumeAction";
@@ -201,7 +250,7 @@ export class AgentConnectClient {
           attempt,
           actionIsResume,
           noProgressResumes,
-          stallRetryStartedAt: undefined,
+          stallRetryStartedAt,
           now: Date.now(),
         });
         let checkpoint: ConversationStateStructure | undefined;
@@ -217,8 +266,16 @@ export class AgentConnectClient {
                 decision: "fail",
                 reason: "checkpoint_unavailable",
                 progress: snapshot,
+                ...(stall ? { stall } : {}),
               }
-            : { attempt, error, kind, ...decided, progress: snapshot };
+            : {
+                attempt,
+                error,
+                kind,
+                ...decided,
+                progress: snapshot,
+                ...(stall ? { stall } : {}),
+              };
         options.onAttemptFailed?.(failure);
 
         if (failure.decision === "complete") return;
@@ -226,6 +283,12 @@ export class AgentConnectClient {
           this.client.resetConnection?.();
           if (failure.reason === "no_progress") {
             throw new NoResumeProgressError(error);
+          }
+          if (failure.reason === "stall_budget" && stall) {
+            throw new ConnectionStalledError(
+              stall,
+              "Connection stalled repeatedly",
+            );
           }
           throw error;
         }
@@ -239,10 +302,14 @@ export class AgentConnectClient {
           noProgressResumes++;
         }
 
+        stallRetryStartedAt =
+          kind === "stall" ? (stallRetryStartedAt ?? Date.now()) : undefined;
         options.onConnectionStateChange?.({ state: "reconnecting" });
         this.client.resetConnection?.();
         attempt++;
         await backoff(attempt, options.signal, options.backoffMs);
+      } finally {
+        attemptControl.dispose();
       }
     }
   }
@@ -276,12 +343,13 @@ export class AgentConnectClient {
     initialRequest: AgentClientMessage,
     options: AgentConnectRunOptions,
     progress: RunProgress,
+    attemptControl: AttemptControl,
   ): Promise<void> {
     const controlledExecManager = SimpleControlledExecManager.fromResources(
       options.resources,
     );
 
-    const stallDetector = createNoopStallDetector();
+    const stallDetector = attemptControl.detector;
 
     const baseRequestStream = createWritableIterable<AgentClientMessage>();
 
@@ -296,7 +364,7 @@ export class AgentConnectClient {
       signal?: AbortSignal;
       headers?: Record<string, string>;
     } = {};
-    if (options.signal) runOptions.signal = options.signal;
+    runOptions.signal = attemptControl.signal;
     if (options.headers) runOptions.headers = options.headers;
 
     const response = this.client.run(baseRequestStream, runOptions);
@@ -304,7 +372,7 @@ export class AgentConnectClient {
     const channels: SplitChannels = splitStream(response, {
       detector: stallDetector,
       progress,
-      ...(options.signal ? { signal: options.signal } : {}),
+      signal: attemptControl.signal,
       onFirstMessage: () =>
         options.onConnectionStateChange?.({ state: "connected" }),
     });
@@ -323,7 +391,10 @@ export class AgentConnectClient {
               },
             }),
           )
-          .then(scheduleHeartbeat)
+          .then(() => {
+            stallDetector.onClientSentHeartbeat();
+            scheduleHeartbeat();
+          })
           .catch(() => {});
       }, HEARTBEAT_INTERVAL_MS);
     };
@@ -382,6 +453,7 @@ export class AgentConnectClient {
         channels.interactionStream,
         options.interactionListener,
         queryResponseStream,
+        stallDetector,
       );
 
       const execController = new ClientExecController(

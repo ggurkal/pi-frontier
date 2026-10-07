@@ -36,3 +36,8 @@ export {
   type StallDetector,
   splitStream,
 } from "./split-stream";
+export {
+  createStallDetector,
+  MIN_STALL_THRESHOLD_MS,
+  STALL_THRESHOLD_MS,
+} from "./stall-detector";

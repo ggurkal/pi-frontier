@@ -25,18 +25,34 @@ export interface InteractionListener {
   ): Promise<CoreInteractionResponse>;
 }
 
+/** Cursor's `Imd`: queries that wait on a human, so silence is expected. */
+const HUMAN_QUERY_CASES: ReadonlySet<string> = new Set([
+  "askQuestionInteractionQuery",
+  "switchModeRequestQuery",
+  "mcpAuthRequestQuery",
+  "connectScmRequestQuery",
+]);
+
+export interface StallSuspender {
+  setPaused(paused: boolean): void;
+}
+
 export class ClientInteractionController {
   private readonly interactionStream: AsyncIterable<InteractionMessage>;
   private readonly interactionListener: InteractionListener;
   private readonly queryResponseStream: Writable<InteractionResponse>;
   /** Updates are applied in order on this chain; it never rejects. */
   private tail: Promise<void> = Promise.resolve();
+  private readonly stallSuspender: StallSuspender | undefined;
+  private pendingHumanQueries = 0;
 
   constructor(
     interactionStream: AsyncIterable<InteractionMessage>,
     interactionListener: InteractionListener,
     queryResponseStream: Writable<InteractionResponse>,
+    stallSuspender?: StallSuspender,
   ) {
+    this.stallSuspender = stallSuspender;
     this.interactionStream = interactionStream;
     this.interactionListener = interactionListener;
     this.queryResponseStream = queryResponseStream;
@@ -85,8 +101,17 @@ export class ClientInteractionController {
     queryProto: InteractionQuery,
   ): void {
     const coreQuery = convertProtoToInteractionQuery(queryProto);
+    const human = HUMAN_QUERY_CASES.has(queryProto.query.case ?? "");
+    if (human && this.pendingHumanQueries++ === 0) {
+      this.stallSuspender?.setPaused(true);
+    }
     void this.interactionListener
       .query(ctx, coreQuery)
+      .finally(() => {
+        if (human && --this.pendingHumanQueries === 0) {
+          this.stallSuspender?.setPaused(false);
+        }
+      })
       .then((response) => {
         const responseProto = convertInteractionResponseToProto(
           response,

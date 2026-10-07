@@ -1228,6 +1228,64 @@ test("every retry is logged before the final outcome", async () => {
   );
 });
 
+async function withStallThreshold(
+  thresholdMs: number,
+  body: () => Promise<void>,
+): Promise<void> {
+  streamModule.setConnectTimings({
+    backoffMs: () => 0,
+    stallThresholdMs: thresholdMs,
+  });
+  try {
+    await body();
+  } finally {
+    streamModule.setConnectTimings({ backoffMs: () => 0, stallThresholdMs: 0 });
+  }
+}
+
+test("a stalled stream resumes from its clean checkpoint", async () => {
+  await withStallThreshold(50, async () => {
+    const sessionId = newSessionId();
+    const s1 = startStream(sessionId, [user("hello")]);
+    const run = await waitForRun(0);
+    run.checkpoint(checkpointState([]));
+
+    const retry = await waitForRun(1);
+    assert.equal(run.aborted, true);
+    assert.equal(retry.runRequest.action?.action.case, "resumeAction");
+    assert.equal(resetCount, 1);
+    retry.text("x");
+    retry.end();
+
+    assert.equal(textOf(await s1.result()), "x");
+    const [entry] = await readStreamErrorLog(sessionId);
+    assert.equal(entry?.["kind"], "stall");
+    assert.equal(entry?.["outcome"], "retried");
+    assert.equal(
+      (entry?.["stall"] as { thresholdMs?: number } | undefined)?.thresholdMs,
+      50,
+    );
+  });
+});
+
+test("server heartbeats keep a quiet stream alive", async () => {
+  await withStallThreshold(50, async () => {
+    const sessionId = newSessionId();
+    const s1 = startStream(sessionId, [user("hello")]);
+    const run = await waitForRun(0);
+    const end = Date.now() + 200;
+    while (Date.now() < end) {
+      run.heartbeat();
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+    run.text("ok");
+    run.end();
+
+    assert.equal(textOf(await s1.result()), "ok");
+    assert.equal(runs.length, 1);
+  });
+});
+
 test("an unrelated error after turnEnded still fails the turn and is not logged", async () => {
   const sessionId = newSessionId();
   const s1 = startStream(sessionId, [user("hello")]);

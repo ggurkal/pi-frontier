@@ -7,6 +7,8 @@ import {
   AgentServerMessage,
   ConversationAction,
   ConversationStateStructure,
+  HeartbeatUpdate,
+  InteractionQuery,
   InteractionUpdate,
   TextDeltaUpdate,
   TokenDeltaUpdate,
@@ -14,6 +16,10 @@ import {
   UserMessage,
   UserMessageAction,
 } from "../../../src/__generated__/agent/v1/agent_pb.js";
+import {
+  AskQuestionArgs,
+  AskQuestionInteractionQuery,
+} from "../../../src/__generated__/agent/v1/ask_question_tool_pb.js";
 import {
   AgentConnectClient,
   type AgentConnectRunOptions,
@@ -319,4 +325,101 @@ test("resumes that stream without a checkpoint stop", async () => {
   ]);
   await assert.rejects(promise, NoResumeProgressError);
   assert.equal(calls.length, 3);
+});
+
+test("a stalled attempt resumes from its clean checkpoint", async () => {
+  const failures: AttemptFailure[] = [];
+  const signals: AbortSignal[] = [];
+  let latest: ConversationStateStructure | undefined;
+  let calls = 0;
+  const client: AgentRpcClient = {
+    run(_input, options) {
+      const attempt = calls++;
+      if (options?.signal) signals.push(options.signal);
+      const signal = options?.signal;
+      return (async function* () {
+        if (attempt === 0) {
+          yield checkpoint();
+          await new Promise<never>((_resolve, reject) => {
+            signal?.addEventListener("abort", () => reject(signal.reason));
+          });
+        }
+        for (let i = 0; i < 12; i++) {
+          yield update({ case: "heartbeat", value: new HeartbeatUpdate() });
+          await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        yield turnEnded();
+      })();
+    },
+  };
+  await new AgentConnectClient(client).run(initialRequest(), {
+    ...baseRunOptions(),
+    backoffMs: () => 0,
+    stallThresholdMs: 40,
+    checkpointHandler: {
+      handleCheckpoint: async (_ctx, state) => {
+        latest = state;
+      },
+      getLatestCheckpoint: () => latest,
+    },
+    onAttemptFailed: (failure) => failures.push(failure),
+  });
+  assert.equal(calls, 2);
+  assert.equal(signals[0]?.aborted, true);
+  assert.equal(failures.length, 1);
+  assert.equal(decisionOf(failures[0]), "resume/clean_checkpoint");
+  assert.equal(failures[0]?.kind, "stall");
+  assert.equal(failures[0]?.stall?.thresholdMs, 40);
+});
+
+test("a human query pauses stall detection", async () => {
+  const failures: AttemptFailure[] = [];
+  let calls = 0;
+  const client: AgentRpcClient = {
+    run(_input, options) {
+      calls++;
+      const signal = options?.signal;
+      return (async function* () {
+        yield new AgentServerMessage({
+          message: {
+            case: "interactionQuery",
+            value: new InteractionQuery({
+              id: 1,
+              query: {
+                case: "askQuestionInteractionQuery",
+                value: new AskQuestionInteractionQuery({
+                  args: new AskQuestionArgs(),
+                  toolCallId: "ask-1",
+                }),
+              },
+            }),
+          },
+        });
+        await new Promise((resolve, reject) => {
+          setTimeout(resolve, 150);
+          signal?.addEventListener("abort", () => reject(signal.reason));
+        });
+        yield turnEnded();
+      })();
+    },
+  };
+  let answered!: () => void;
+  const answer = new Promise<void>((resolve) => {
+    answered = resolve;
+  });
+  setTimeout(() => answered(), 140);
+  await new AgentConnectClient(client).run(initialRequest(), {
+    ...baseRunOptions(),
+    stallThresholdMs: 40,
+    interactionListener: {
+      sendUpdate: async () => {},
+      query: async () => {
+        await answer;
+        return { approved: false, reason: "unused" };
+      },
+    },
+    onAttemptFailed: (failure) => failures.push(failure),
+  });
+  assert.equal(calls, 1);
+  assert.equal(failures.length, 0);
 });

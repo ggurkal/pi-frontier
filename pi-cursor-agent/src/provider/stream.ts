@@ -64,6 +64,7 @@ import {
   type LiveSession,
   setLiveSession,
 } from "./agent-stream-hook";
+import { PI_CURSOR_AGENT_STALL_TIMEOUT_MS } from "./env";
 import { toCursorId } from "./model-mapping";
 import { createSteerDispatcher } from "./pending-messages";
 import {
@@ -754,6 +755,8 @@ async function startRun(
     agentStore.getConversationStateStructure();
 
   const runOptions: Parameters<typeof connectClient.run>[1] = {
+    stallThresholdMs:
+      connectTimings.stallThresholdMs ?? PI_CURSOR_AGENT_STALL_TIMEOUT_MS,
     ...(connectTimings.backoffMs
       ? { backoffMs: connectTimings.backoffMs }
       : {}),

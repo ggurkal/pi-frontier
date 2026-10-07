@@ -39,6 +39,9 @@ function detector(calls: string[] = []): StallDetector {
     onServerSentHeartbeat: () => calls.push("server-heartbeat"),
     reset: (type, label) => calls.push(`${type}:${label}`),
     onStreamEnded: () => calls.push("ended"),
+    onClientSentHeartbeat: () => {},
+    setPaused: () => {},
+    dispose: () => {},
   };
 }
 
