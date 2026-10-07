@@ -1029,19 +1029,197 @@ test("a stream cut after turnEnded with a stale checkpoint fails the turn", asyn
   assert.equal(entry?.["checkpointCurrent"], false);
 });
 
-test("a stream cut before turnEnded fails the turn", async () => {
+test("a stream cut after a clean checkpoint resumes from it", async () => {
   const sessionId = newSessionId();
   const s1 = startStream(sessionId, [user("hello")]);
   const run = await waitForRun(0);
   run.text("partial");
+  const marker = new Uint8Array([9]);
+  run.checkpoint(checkpointState([marker]));
+  run.fail(truncated());
+
+  const retry = await waitForRun(1);
+  assert.equal(retry.runRequest.action?.action.case, "resumeAction");
+  assert.deepEqual(retry.runRequest.conversationState?.turns, [marker]);
+  assert.equal(
+    retry.headers["x-original-request-id"],
+    run.headers["x-original-request-id"],
+  );
+  assert.notEqual(retry.headers["x-request-id"], run.headers["x-request-id"]);
+  retry.text(" more");
+  retry.end();
+
+  const reply = await s1.result();
+  assert.equal(reply.stopReason, "stop");
+  assert.equal(textOf(reply), "partial more");
+  const entries = await readStreamErrorLog(sessionId);
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0]?.["outcome"], "retried");
+  assert.equal(entries[0]?.["decision"], "resume");
+  assert.equal(entries[0]?.["reason"], "clean_checkpoint");
+  assert.equal(entries[0]?.["turnEnded"], false);
+});
+
+test("a stream cut after output that follows the checkpoint fails the turn", async () => {
+  const sessionId = newSessionId();
+  const s1 = startStream(sessionId, [user("hello")]);
+  const run = await waitForRun(0);
   run.checkpoint(checkpointState([]));
+  run.text("partial");
   run.fail(truncated());
 
   const reply = await s1.result();
   assert.equal(reply.stopReason, "error");
+  assert.equal(runs.length, 1);
   const [entry] = await readStreamErrorLog(sessionId);
   assert.equal(entry?.["outcome"], "failed");
+  assert.equal(entry?.["reason"], "output_since_checkpoint");
   assert.equal(entry?.["turnEnded"], false);
+});
+
+test("a lost connection after output with no checkpoint does not resend the prompt", async () => {
+  const sessionId = newSessionId();
+  const s1 = startStream(sessionId, [user("hello")]);
+  const run = await waitForRun(0);
+  run.text("partial");
+  run.fail(new LostConnection("drop"));
+
+  const reply = await s1.result();
+  assert.equal(reply.stopReason, "error");
+  assert.equal(runs.length, 1);
+});
+
+test("a stream cut during a Pi tool resumes and the resent exec reuses the running tool", async () => {
+  const sessionId = newSessionId();
+  const history: Context["messages"] = [user("hello")];
+  const s1 = startStream(sessionId, history);
+  const run = await waitForRun(0);
+  run.text("looking");
+  run.readTool("call-1");
+  const assistant = await s1.result();
+  assert.equal(assistant.stopReason, "toolUse");
+  run.checkpoint(checkpointState([]));
+  run.fail(new LostConnection("drop"));
+
+  const retry = await waitForRun(1);
+  assert.equal(retry.runRequest.action?.action.case, "resumeAction");
+  retry.readTool("call-1");
+  const result = toolResult("call-1");
+  await retry.waitForExecResults(1);
+
+  const s2 = startStream(sessionId, [...history, assistant, result]);
+  retry.text("done");
+  retry.end();
+  const reply = await s2.result();
+  assert.equal(reply.stopReason, "stop");
+  assert.equal(textOf(reply), "done");
+});
+
+test("a resent exec after the tool finished gets the cached result", async () => {
+  const sessionId = newSessionId();
+  const { run, history } = await runUntilToolBatch(sessionId);
+  run.checkpoint(checkpointState([]));
+  await settleEvents();
+  run.fail(new LostConnection("drop"));
+
+  const retry = await waitForRun(1);
+  retry.readTool("call-1");
+  await retry.waitForExecResults(1);
+
+  const s2 = startStream(sessionId, history);
+  retry.text("ok");
+  retry.end();
+  assert.equal(textOf(await s2.result()), "ok");
+});
+
+test("an exec after the last checkpoint fails the turn on a cut", async () => {
+  const sessionId = newSessionId();
+  const history: Context["messages"] = [user("hello")];
+  const s1 = startStream(sessionId, history);
+  const run = await waitForRun(0);
+  run.checkpoint(checkpointState([]));
+  run.readTool("call-1");
+  const assistant = await s1.result();
+  assert.equal(assistant.stopReason, "toolUse");
+  run.fail(truncated());
+  const result = toolResult("call-1");
+
+  const s2 = startStream(sessionId, [...history, assistant, result]);
+  const reply = await s2.result();
+  assert.equal(reply.stopReason, "error");
+  assert.equal(runs.length, 1);
+  const [entry] = await readStreamErrorLog(sessionId);
+  assert.equal(entry?.["reason"], "output_since_checkpoint");
+});
+
+test("a clean end without turnEnded before any output resends the prompt", async () => {
+  const sessionId = newSessionId();
+  const s1 = startStream(sessionId, [user("hello")]);
+  const run = await waitForRun(0);
+  run.end({ turnEnded: false });
+
+  const retry = await waitForRun(1);
+  assert.equal(retry.runText, "hello");
+  retry.text("hi");
+  retry.end();
+  assert.equal(textOf(await s1.result()), "hi");
+});
+
+test("a clean end without turnEnded after output fails the turn", async () => {
+  const sessionId = newSessionId();
+  const s1 = startStream(sessionId, [user("hello")]);
+  const run = await waitForRun(0);
+  run.text("partial");
+  run.end({ turnEnded: false });
+
+  const reply = await s1.result();
+  assert.equal(reply.stopReason, "error");
+  assert.match(reply.errorMessage ?? "", /Stream ended without turnEnded/);
+});
+
+test("a steer still unacked after a resume is owed as the next run", async () => {
+  const sessionId = newSessionId();
+  const { run, history } = await runUntilToolBatch(sessionId);
+  const s2 = startStream(sessionId, [...history, user("s1")]);
+  await run.waitForInjections(1);
+  run.checkpoint(checkpointState([]));
+  await settleEvents();
+  run.fail(new LostConnection("drop"));
+
+  const retry = await waitForRun(1);
+  await settleEvents();
+  assert.equal(retry.injections().length, 0);
+  retry.text("done");
+  retry.end();
+
+  const next = await waitForRun(2);
+  assert.equal(next.runText, "s1");
+  next.end();
+  await s2.result();
+});
+
+test("every retry is logged before the final outcome", async () => {
+  const sessionId = newSessionId();
+  const s1 = startStream(sessionId, [user("hello")]);
+  const first = await waitForRun(0);
+  first.checkpoint(checkpointState([]));
+  first.fail(truncated());
+  const second = await waitForRun(1);
+  second.checkpoint(checkpointState([]));
+  second.fail(truncated());
+  const third = await waitForRun(2);
+  third.text("finally");
+  third.end();
+
+  assert.equal(textOf(await s1.result()), "finally");
+  const entries = await readStreamErrorLog(sessionId);
+  assert.deepEqual(
+    entries.map((entry) => [entry["outcome"], entry["attempt"]]),
+    [
+      ["retried", 0],
+      ["retried", 1],
+    ],
+  );
 });
 
 test("an unrelated error after turnEnded still fails the turn and is not logged", async () => {

@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { Code, ConnectError } from "@connectrpc/connect";
 import {
   AgentClientMessage,
   AgentRunRequest,
@@ -8,6 +9,7 @@ import {
   ConversationStateStructure,
   InteractionUpdate,
   TextDeltaUpdate,
+  TokenDeltaUpdate,
   TurnEndedUpdate,
   UserMessage,
   UserMessageAction,
@@ -16,7 +18,12 @@ import {
   AgentConnectClient,
   type AgentConnectRunOptions,
   type AgentRpcClient,
+  type AttemptFailure,
 } from "../../../src/vendor/agent-client/connect.js";
+import {
+  NoResumeProgressError,
+  StreamEndedWithoutTurnEndedError,
+} from "../../../src/vendor/agent-client/retry-policy.js";
 
 function initialRequest(text = "hello"): AgentClientMessage {
   return new AgentClientMessage({
@@ -67,6 +74,9 @@ const textDelta = (text: string) =>
 
 const turnEnded = () =>
   update({ case: "turnEnded", value: new TurnEndedUpdate() });
+
+const tokenDelta = () =>
+  update({ case: "tokenDelta", value: new TokenDeltaUpdate({ tokens: 1 }) });
 
 const checkpoint = (state = new ConversationStateStructure()) =>
   new AgentServerMessage({
@@ -129,4 +139,171 @@ test("a checkpoint is applied after the updates that precede it", async () => {
     },
   });
   assert.deepEqual(order, ["update", "checkpoint"]);
+});
+
+const truncated = () =>
+  new ConnectError(
+    "protocol error: missing EndStreamResponse",
+    Code.InvalidArgument,
+  );
+
+/** Runs `attempts` and records failures; the checkpoint handler keeps the latest. */
+async function runScripted(
+  attempts: ScriptedAttempt[],
+  extra: Partial<AgentConnectRunOptions> = {},
+) {
+  const { client, calls } = scriptedClient(attempts);
+  const failures: AttemptFailure[] = [];
+  let latest: ConversationStateStructure | undefined;
+  const promise = new AgentConnectClient(client).run(initialRequest(), {
+    ...baseRunOptions(),
+    backoffMs: () => 0,
+    checkpointHandler: {
+      handleCheckpoint: async (_ctx, state) => {
+        latest = state;
+      },
+      getLatestCheckpoint: () => latest,
+    },
+    onAttemptFailed: (failure) => failures.push(failure),
+    ...extra,
+  });
+  return { promise, calls, failures };
+}
+
+const decisionOf = (failure: AttemptFailure | undefined) =>
+  failure && `${failure.decision}/${failure.reason}`;
+
+test("a cut after a clean checkpoint resumes from it", async () => {
+  const state = new ConversationStateStructure({
+    turns: [new Uint8Array([1])],
+  });
+  const { promise, calls, failures } = await runScripted([
+    { messages: [textDelta("a"), checkpoint(state)], error: truncated() },
+    { messages: [turnEnded()] },
+  ]);
+  await promise;
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1]?.request.action?.action.case, "resumeAction");
+  assert.deepEqual(calls[1]?.request.conversationState, state);
+  assert.equal(failures.length, 1);
+  assert.equal(decisionOf(failures[0]), "resume/clean_checkpoint");
+  assert.equal(failures[0]?.kind, "transport");
+});
+
+test("a cut after output that follows the checkpoint fails", async () => {
+  const error = truncated();
+  const { promise, calls, failures } = await runScripted([
+    { messages: [checkpoint(), textDelta("a")], error },
+  ]);
+  await assert.rejects(promise, (thrown) => thrown === error);
+  assert.equal(calls.length, 1);
+  assert.equal(decisionOf(failures[0]), "fail/output_since_checkpoint");
+});
+
+test("a failure before any message resends the original action", async () => {
+  const { promise, calls, failures } = await runScripted([
+    {
+      messages: [],
+      error: Object.assign(new Error("connect failed"), {
+        code: "ECONNREFUSED",
+      }),
+    },
+    { messages: [turnEnded()] },
+  ]);
+  await promise;
+  assert.equal(calls.length, 2);
+  assert.equal(calls[1]?.request.action?.action.case, "userMessageAction");
+  assert.equal(decisionOf(failures[0]), "resend/no_output");
+});
+
+test("a cut after turnEnded and a terminal checkpoint completes", async () => {
+  const { promise, calls, failures } = await runScripted([
+    {
+      messages: [textDelta("a"), turnEnded(), checkpoint()],
+      error: truncated(),
+    },
+  ]);
+  await promise;
+  assert.equal(calls.length, 1);
+  assert.equal(decisionOf(failures[0]), "complete/terminal_checkpoint");
+});
+
+test("a cut after checkpoint then turnEnded completes", async () => {
+  const { promise, failures } = await runScripted([
+    {
+      messages: [textDelta("a"), checkpoint(), turnEnded()],
+      error: truncated(),
+    },
+  ]);
+  await promise;
+  assert.equal(
+    decisionOf(failures[0]),
+    "complete/clean_checkpoint_before_turn_end",
+  );
+});
+
+test("a clean end without turnEnded after output fails", async () => {
+  const { promise, failures } = await runScripted([
+    { messages: [textDelta("a")] },
+  ]);
+  await assert.rejects(promise, StreamEndedWithoutTurnEndedError);
+  assert.equal(decisionOf(failures[0]), "fail/output_since_checkpoint");
+});
+
+test("a non-transport error is rethrown without a decision", async () => {
+  const error = new ConnectError("boom", Code.Internal);
+  const { promise, failures } = await runScripted([
+    { messages: [checkpoint()], error },
+  ]);
+  await assert.rejects(promise, (thrown) => thrown === error);
+  assert.equal(failures.length, 0);
+});
+
+test("a session abort is rethrown without a decision", async () => {
+  const controller = new AbortController();
+  const failures: AttemptFailure[] = [];
+  let calls = 0;
+  const client: AgentRpcClient = {
+    run(_input, options) {
+      calls++;
+      return (async function* () {
+        await new Promise<never>((_resolve, reject) => {
+          options?.signal?.addEventListener("abort", () =>
+            reject(new ConnectError("Premature close", Code.Unknown)),
+          );
+        });
+      })();
+    },
+  };
+  const promise = new AgentConnectClient(client).run(initialRequest(), {
+    ...baseRunOptions(),
+    signal: controller.signal,
+    onAttemptFailed: (failure) => failures.push(failure),
+  });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  controller.abort();
+  await assert.rejects(promise);
+  assert.equal(failures.length, 0);
+  assert.equal(calls, 1);
+});
+
+test("retries stop at the cap", async () => {
+  const attempts = Array.from({ length: 7 }, () => ({
+    messages: [checkpoint()],
+    error: truncated(),
+  }));
+  const { promise, calls, failures } = await runScripted(attempts);
+  await assert.rejects(promise);
+  assert.equal(calls.length, 6);
+  assert.equal(decisionOf(failures.at(-1)), "fail/retry_cap");
+});
+
+test("resumes that stream without a checkpoint stop", async () => {
+  const { promise, calls } = await runScripted([
+    { messages: [checkpoint()], error: truncated() },
+    { messages: [tokenDelta()], error: truncated() },
+    { messages: [tokenDelta()], error: truncated() },
+  ]);
+  await assert.rejects(promise, NoResumeProgressError);
+  assert.equal(calls.length, 3);
 });

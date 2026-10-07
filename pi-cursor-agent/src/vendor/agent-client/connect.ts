@@ -27,11 +27,21 @@ import {
   CheckpointController,
   type CheckpointHandler,
 } from "./checkpoint-controller";
-import { ClientExecController, LostConnection } from "./exec-controller";
+import { ClientExecController } from "./exec-controller";
 import {
   ClientInteractionController,
   type InteractionListener,
 } from "./interaction-controller";
+import {
+  decideRetry,
+  type FailureKind,
+  isTransportError,
+  NoResumeProgressError,
+  type ProgressSnapshot,
+  type RetryDecision,
+  type StallInfo,
+} from "./retry-policy";
+import { RunProgress } from "./run-progress";
 import {
   type SplitChannels,
   type StallDetector,
@@ -64,10 +74,21 @@ export interface AgentConnectRunOptions {
   ) => void;
   /** Delay before retry `attempt` (1-based). */
   backoffMs?: (attempt: number) => number;
+  /** Every transport or stall failure and the decision taken, before acting on it. */
+  onAttemptFailed?: (failure: AttemptFailure) => void;
+}
+
+export interface AttemptFailure {
+  attempt: number;
+  error: unknown;
+  kind: FailureKind;
+  decision: RetryDecision["decision"];
+  reason: RetryDecision["reason"] | "checkpoint_unavailable";
+  progress: ProgressSnapshot;
+  stall?: StallInfo;
 }
 
 const HEARTBEAT_INTERVAL_MS = 5_000;
-const MAX_RETRY_ATTEMPTS = 5;
 export const ORIGINAL_REQUEST_ID_HEADER = "x-original-request-id";
 
 function createNoopStallDetector(): StallDetector {
@@ -76,12 +97,6 @@ function createNoopStallDetector(): StallDetector {
     reset() {},
     onStreamEnded() {},
   };
-}
-
-function isRetriableError(error: unknown): boolean {
-  if (error instanceof LostConnection) return true;
-  if (error instanceof Error && error.message.includes("NGHTTP2")) return true;
-  return false;
 }
 
 /**
@@ -126,16 +141,13 @@ export class AgentConnectClient {
   }
 
   /**
-   * Public entry point with centralized retry and resume logic.
-   *
-   * Retry behavior:
-   * - Transport/stall errors: retry indefinitely with exponential backoff
-   * - Server errors (high load): retry up to MAX_SERVER_ERROR_RETRIES times
-   * - Non-retriable errors: surface immediately
-   *
-   * Checkpoint behavior:
-   * - If a NEW checkpoint was received before failure, resume from checkpoint
-   * - If NO checkpoint was received, resend the original action (prevents message loss)
+   * Runs the request, retrying transport failures where that cannot repeat
+   * anything Pi already received:
+   * - the turn ended and a checkpoint covers it: complete;
+   * - output arrived since the last checkpoint: fail;
+   * - a checkpoint arrived in the failed attempt: resume from it;
+   * - nothing arrived: resend the current action.
+   * Other errors, and any error after the session aborts, are rethrown.
    */
   async run(
     initialRequest: AgentClientMessage,
@@ -143,7 +155,6 @@ export class AgentConnectClient {
   ): Promise<void> {
     const runRequest = initialRequest.message.value as AgentRunRequest;
 
-    // Retry state
     let currentState = runRequest.conversationState;
     let currentAction = runRequest.action;
     if (!currentAction) {
@@ -152,41 +163,15 @@ export class AgentConnectClient {
     const modelDetails = runRequest.modelDetails;
     const mcpTools = runRequest.mcpTools;
     const conversationId = runRequest.conversationId;
+    const progress = new RunProgress();
     let attempt = 0;
-    const receivedNewCheckpoint = { value: false };
+    let noProgressResumes = 0;
 
-    // Helper: switch to ResumeAction if we received a checkpoint
-    const maybeResumeFromCheckpoint = () => {
-      if (!receivedNewCheckpoint.value) return;
-      const checkpoint = options.checkpointHandler.getLatestCheckpoint?.();
-      if (!checkpoint) return;
-      currentState = checkpoint;
-      currentAction = new ConversationAction({
-        action: { case: "resumeAction", value: new ResumeAction() },
-      });
-    };
-
-    // Wrap checkpoint handler to track when we receive new checkpoints
-    const trackingCheckpointHandler: CheckpointHandler = {
-      async handleCheckpoint(
-        ctx: unknown,
-        checkpoint: ConversationStateStructure,
-      ): Promise<void> {
-        receivedNewCheckpoint.value = true;
-        return options.checkpointHandler.handleCheckpoint(ctx, checkpoint);
-      },
-      getLatestCheckpoint: () =>
-        options.checkpointHandler.getLatestCheckpoint?.(),
-    };
-
-    // Main retry loop
     while (true) {
       if (options.signal?.aborted) {
         throw new Error("Request cancelled");
       }
-
-      // Reset per-attempt flags
-      receivedNewCheckpoint.value = false;
+      progress.startAttempt();
 
       try {
         const request = this.buildRequest(
@@ -197,21 +182,61 @@ export class AgentConnectClient {
           conversationId,
         );
 
-        await this.runInternal(request, {
-          ...options,
-          ...attemptHeaders(options.headers, attempt),
-          checkpointHandler: trackingCheckpointHandler,
-        });
+        await this.runInternal(
+          request,
+          { ...options, ...attemptHeaders(options.headers, attempt) },
+          progress,
+        );
         return;
       } catch (error) {
-        if (!isRetriableError(error) || attempt >= MAX_RETRY_ATTEMPTS) {
+        if (options.signal?.aborted) throw error;
+        if (!isTransportError(error, progress.turnEnded)) throw error;
+        const kind: FailureKind = "transport";
+
+        const snapshot = progress.snapshot();
+        const actionIsResume = currentAction.action.case === "resumeAction";
+        const decided = decideRetry(kind, snapshot, {
+          attempt,
+          actionIsResume,
+          noProgressResumes,
+          stallRetryStartedAt: undefined,
+          now: Date.now(),
+        });
+        let checkpoint: ConversationStateStructure | undefined;
+        if (decided.decision === "resume") {
+          checkpoint = options.checkpointHandler.getLatestCheckpoint?.();
+        }
+        const failure: AttemptFailure =
+          decided.decision === "resume" && !checkpoint
+            ? {
+                attempt,
+                error,
+                kind,
+                decision: "fail",
+                reason: "checkpoint_unavailable",
+                progress: snapshot,
+              }
+            : { attempt, error, kind, ...decided, progress: snapshot };
+        options.onAttemptFailed?.(failure);
+
+        if (failure.decision === "complete") return;
+        if (failure.decision === "fail") {
+          if (failure.reason === "no_progress") {
+            throw new NoResumeProgressError(error);
+          }
           throw error;
         }
+        if (failure.decision === "resume") {
+          currentState = checkpoint;
+          currentAction = new ConversationAction({
+            action: { case: "resumeAction", value: new ResumeAction() },
+          });
+          noProgressResumes = 0;
+        } else if (actionIsResume && snapshot.streamed) {
+          noProgressResumes++;
+        }
 
-        // Retry: notify UI, maybe resume from checkpoint, backoff
         options.onConnectionStateChange?.({ state: "reconnecting" });
-        maybeResumeFromCheckpoint();
-
         attempt++;
         await backoff(attempt, options.signal, options.backoffMs);
       }
@@ -246,6 +271,7 @@ export class AgentConnectClient {
   private async runInternal(
     initialRequest: AgentClientMessage,
     options: AgentConnectRunOptions,
+    progress: RunProgress,
   ): Promise<void> {
     const controlledExecManager = SimpleControlledExecManager.fromResources(
       options.resources,
@@ -271,9 +297,13 @@ export class AgentConnectClient {
 
     const response = this.client.run(baseRequestStream, runOptions);
 
-    const channels: SplitChannels = splitStream(response, stallDetector, () =>
-      options.onConnectionStateChange?.({ state: "connected" }),
-    );
+    const channels: SplitChannels = splitStream(response, {
+      detector: stallDetector,
+      progress,
+      ...(options.signal ? { signal: options.signal } : {}),
+      onFirstMessage: () =>
+        options.onConnectionStateChange?.({ state: "connected" }),
+    });
 
     // Heartbeat sender using setTimeout (not setInterval)
     let heartbeatTimeout: ReturnType<typeof setTimeout> | undefined;
@@ -309,6 +339,7 @@ export class AgentConnectClient {
         AgentClientMessage
       >(baseRequestStream, (message) => {
         if (message instanceof ExecClientMessage) {
+          progress.onExecResultSent();
           return new AgentClientMessage({
             message: { case: "execClientMessage", value: message },
           });

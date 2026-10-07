@@ -58,7 +58,8 @@ export interface SteerDispatcher {
   /**
    * Bind to a (re)created request stream and write pending injections.
    * A reconnect resumes from the last checkpoint, so steers delivered after
-   * it are sent again. Other injections stay open for a late ack.
+   * it are sent again. Other injections stay open for a late ack: the server
+   * matches them by `expectedRunId`, which survives retries.
    */
   bind(stream: WritableIterable<AgentClientMessage>): Promise<void>;
   /** Stop writing. Recorded steers stay available to `settle`. */

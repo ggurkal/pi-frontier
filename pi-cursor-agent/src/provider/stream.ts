@@ -41,6 +41,7 @@ import {
 } from "../vendor/agent-client";
 import {
   type AgentRpcClient,
+  type AttemptFailure,
   ORIGINAL_REQUEST_ID_HEADER,
 } from "../vendor/agent-client/connect";
 import type {
@@ -72,7 +73,7 @@ import {
   terminateSession,
 } from "./session-lifecycle";
 import { type CursorStateStore, createOverlayState } from "./state";
-import { isTruncatedStreamError, logStreamError } from "./stream-error-log";
+import { logStreamError, streamErrorLogEntry } from "./stream-error-log";
 
 function createCheckpointHandler(
   handler: (checkpoint: ConversationStateStructure) => void,
@@ -697,15 +698,12 @@ async function startRun(
   const runId = crypto.randomUUID();
   const steers = createSteerDispatcher({ runId });
   let checkpointCurrent = false;
-  let turnEnded = false;
   let steerDelivered = false;
+  let logChain: Promise<void> = Promise.resolve();
 
   const handleInteractionUpdate = (update: CoreInteractionUpdate) => {
     if (OUTPUT_UPDATE_TYPES.has(update.type)) checkpointCurrent = false;
     switch (update.type) {
-      case "turn-ended":
-        turnEnded = true;
-        return;
       case "text-delta":
         channel.push({
           kind: "content",
@@ -759,6 +757,15 @@ async function startRun(
     ...(connectTimings.backoffMs
       ? { backoffMs: connectTimings.backoffMs }
       : {}),
+    onAttemptFailed: (failure: AttemptFailure) => {
+      const entry = streamErrorLogEntry(failure, {
+        runId,
+        checkpointCurrent,
+        steerDelivered,
+        aborted: sessionSignal.aborted,
+      });
+      logChain = logChain.then(() => logStreamError(sessionId, entry));
+    },
     interactionListener,
     resources,
     blobStore,
@@ -785,28 +792,13 @@ async function startRun(
 
   const cursorRunPromise = connectClient
     .run(initialRequest, runOptions)
-    .then(() => channel.push({ kind: "cursor-done" }))
+    .then(async () => {
+      await logChain;
+      channel.push({ kind: "cursor-done" });
+    })
     .catch(async (error) => {
-      if (!isTruncatedStreamError(error)) {
-        channel.push({ kind: "cursor-error", error });
-        return;
-      }
-      // Cursor can cut the stream after the turn is over. Only a checkpoint
-      // taken after the last output keeps the next turn's state complete.
-      const completed = turnEnded && checkpointCurrent;
-      await logStreamError(sessionId, {
-        runId,
-        error: error instanceof Error ? error.message : String(error),
-        code: (error as { code?: unknown })?.code,
-        turnEnded,
-        checkpointCurrent,
-        steerDelivered,
-        aborted: sessionSignal.aborted,
-        outcome: completed ? "completed" : "failed",
-      });
-      channel.push(
-        completed ? { kind: "cursor-done" } : { kind: "cursor-error", error },
-      );
+      await logChain;
+      channel.push({ kind: "cursor-error", error });
     })
     .finally(() => {
       unlinkSignals();

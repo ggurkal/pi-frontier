@@ -6,6 +6,7 @@ export {
   AgentConnectClient,
   type AgentConnectRunOptions,
   type AgentRpcClient,
+  type AttemptFailure,
 } from "./connect";
 export {
   ClientExecController,
@@ -16,6 +17,18 @@ export {
   ClientInteractionController,
   type InteractionListener,
 } from "./interaction-controller";
+export {
+  ConnectionStalledError,
+  decideRetry,
+  isTransportError,
+  MAX_RETRY_ATTEMPTS,
+  NoResumeProgressError,
+  type ProgressSnapshot,
+  type RetryDecision,
+  type StallInfo,
+  StreamEndedWithoutTurnEndedError,
+} from "./retry-policy";
+export { RunProgress } from "./run-progress";
 export {
   type ExecMessage,
   type InteractionMessage,

@@ -10,6 +10,8 @@ import type {
   ExecServerMessage,
 } from "../../__generated__/agent/v1/exec_pb";
 import type { KvServerMessage } from "../../__generated__/agent/v1/kv_pb";
+import { StreamEndedWithoutTurnEndedError } from "./retry-policy";
+import type { RunProgress } from "./run-progress";
 
 export type InteractionMessage =
   | { case: "interactionUpdate"; value: InteractionUpdate }
@@ -61,11 +63,19 @@ function getMessageTypeLabelForStallDetector(
   return parts.filter((p) => p !== undefined).join(":");
 }
 
+export interface SplitStreamOptions {
+  detector: StallDetector;
+  progress: RunProgress;
+  /** The attempt's signal; a clean end without `turnEnded` is expected once it aborts. */
+  signal?: AbortSignal;
+  onFirstMessage?: () => void;
+}
+
 export function splitStream(
   stream: AsyncIterable<AgentServerMessage>,
-  detector: StallDetector,
-  onFirstMessage?: () => void,
+  options: SplitStreamOptions,
 ): SplitChannels {
+  const { detector, progress, signal, onFirstMessage } = options;
   const interactionStream = createWritableIterable<InteractionMessage>();
   const execStream = createWritableIterable<ExecMessage>();
   const checkpointStream = createWritableIterable<ConversationStateStructure>();
@@ -76,6 +86,7 @@ export function splitStream(
   async function run() {
     try {
       for await (const message of stream) {
+        progress.onServerMessage(message);
         // Notify on first message (indicates connection is working)
         if (!firstMessageFired) {
           firstMessageFired = true;
@@ -125,6 +136,9 @@ export function splitStream(
       }
 
       detector.onStreamEnded();
+      if (!progress.turnEnded && !signal?.aborted) {
+        throw new StreamEndedWithoutTurnEndedError();
+      }
     } finally {
       interactionStream.close();
       execStream.close();
