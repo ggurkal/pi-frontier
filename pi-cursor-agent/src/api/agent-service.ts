@@ -102,6 +102,7 @@ export function wrapAbortSafeStream(
 
 class AgentService {
   private readonly client: Client<typeof AgentServiceDef>;
+  private readonly sessionManager: EagerHttp2SessionManager;
 
   constructor(baseUrl: string, options: AgentServiceOptions) {
     const authInterceptor: Interceptor = (next) => async (req) => {
@@ -115,12 +116,13 @@ class AgentService {
       return next(req);
     };
 
+    this.sessionManager = new EagerHttp2SessionManager(baseUrl);
     const transport = createConnectTransport({
       baseUrl,
       httpVersion: "2",
       interceptors: [authInterceptor],
       // Bun workaround; see EagerHttp2SessionManager.
-      sessionManager: new EagerHttp2SessionManager(baseUrl),
+      sessionManager: this.sessionManager,
     });
 
     this.client = createClient(AgentServiceDef, transport);
@@ -128,6 +130,7 @@ class AgentService {
 
   get rpcClient(): AgentRpcClient {
     const client = this.client;
+    const sessionManager = this.sessionManager;
 
     return {
       run(
@@ -144,6 +147,7 @@ class AgentService {
 
         return wrapAbortSafeStream(response, options.signal);
       },
+      resetConnection: () => sessionManager.abort(),
     };
   }
 }

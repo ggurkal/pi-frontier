@@ -268,6 +268,7 @@ class FakeRun {
 }
 
 let runs: FakeRun[] = [];
+let resetCount = 0;
 /** Called from `flushSessionState` when it persists a new checkpoint. */
 let onAppendEntry: (() => void) | undefined;
 let runWaiters: Array<() => void> = [];
@@ -304,6 +305,9 @@ before(async () => {
       runs.push(run);
       for (const resolve of runWaiters.splice(0)) resolve();
       return run.stream();
+    },
+    resetConnection() {
+      resetCount++;
     },
   }));
   streamModule.setConnectTimings({ backoffMs: () => 0, stallThresholdMs: 0 });
@@ -397,6 +401,7 @@ function checkpointState(turns: Uint8Array[]): ConversationStateStructure {
 function newSessionId(): string {
   runs = [];
   runWaiters = [];
+  resetCount = 0;
   return `stream-test-${sessionCounter++}`;
 }
 
@@ -1046,6 +1051,7 @@ test("a stream cut after a clean checkpoint resumes from it", async () => {
     run.headers["x-original-request-id"],
   );
   assert.notEqual(retry.headers["x-request-id"], run.headers["x-request-id"]);
+  assert.equal(resetCount, 1);
   retry.text(" more");
   retry.end();
 

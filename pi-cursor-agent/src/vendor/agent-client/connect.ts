@@ -53,6 +53,8 @@ export interface AgentRpcClient {
     input: AsyncIterable<AgentClientMessage>,
     options?: { signal?: AbortSignal; headers?: Record<string, string> },
   ): AsyncIterable<AgentServerMessage>;
+  /** Drop the HTTP/2 connection so the next request dials a new one. */
+  resetConnection?(): void;
 }
 
 export interface AgentConnectRunOptions {
@@ -221,6 +223,7 @@ export class AgentConnectClient {
 
         if (failure.decision === "complete") return;
         if (failure.decision === "fail") {
+          this.client.resetConnection?.();
           if (failure.reason === "no_progress") {
             throw new NoResumeProgressError(error);
           }
@@ -237,6 +240,7 @@ export class AgentConnectClient {
         }
 
         options.onConnectionStateChange?.({ state: "reconnecting" });
+        this.client.resetConnection?.();
         attempt++;
         await backoff(attempt, options.signal, options.backoffMs);
       }

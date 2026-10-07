@@ -90,3 +90,17 @@ test("rpcClient strips transport signal and still aborts the response stream", a
   assert.deepEqual(seenOptions, { headers: { "x-test": "1" } });
   assert.equal(returnSpy.called, true);
 });
+
+test("rpcClient.resetConnection aborts the HTTP/2 session", () => {
+  let calls = 0;
+  const service = Object.create(AgentService.prototype) as AgentService;
+  Reflect.set(service as object, "client", {});
+  Reflect.set(service as object, "sessionManager", {
+    abort() {
+      calls++;
+    },
+  });
+
+  service.rpcClient.resetConnection?.();
+  assert.equal(calls, 1);
+});

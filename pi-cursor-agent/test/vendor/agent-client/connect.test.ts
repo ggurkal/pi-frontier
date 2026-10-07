@@ -94,7 +94,11 @@ function scriptedClient(attempts: ScriptedAttempt[]) {
     request: AgentRunRequest;
     headers: Record<string, string> | undefined;
   }> = [];
+  const resets = { count: 0 };
   const client: AgentRpcClient = {
+    resetConnection() {
+      resets.count++;
+    },
     run(input, options) {
       const script = attempts[calls.length] ?? { messages: [turnEnded()] };
       const call = {
@@ -114,7 +118,7 @@ function scriptedClient(attempts: ScriptedAttempt[]) {
       })();
     },
   };
-  return { client, calls };
+  return { client, calls, resets };
 }
 
 test("a checkpoint is applied after the updates that precede it", async () => {
@@ -152,7 +156,7 @@ async function runScripted(
   attempts: ScriptedAttempt[],
   extra: Partial<AgentConnectRunOptions> = {},
 ) {
-  const { client, calls } = scriptedClient(attempts);
+  const { client, calls, resets } = scriptedClient(attempts);
   const failures: AttemptFailure[] = [];
   let latest: ConversationStateStructure | undefined;
   const promise = new AgentConnectClient(client).run(initialRequest(), {
@@ -167,7 +171,7 @@ async function runScripted(
     onAttemptFailed: (failure) => failures.push(failure),
     ...extra,
   });
-  return { promise, calls, failures };
+  return { promise, calls, failures, resets };
 }
 
 const decisionOf = (failure: AttemptFailure | undefined) =>
@@ -177,11 +181,12 @@ test("a cut after a clean checkpoint resumes from it", async () => {
   const state = new ConversationStateStructure({
     turns: [new Uint8Array([1])],
   });
-  const { promise, calls, failures } = await runScripted([
+  const { promise, calls, failures, resets } = await runScripted([
     { messages: [textDelta("a"), checkpoint(state)], error: truncated() },
     { messages: [turnEnded()] },
   ]);
   await promise;
+  assert.equal(resets.count, 1);
   assert.equal(calls.length, 2);
   assert.equal(calls[1]?.request.action?.action.case, "resumeAction");
   assert.deepEqual(calls[1]?.request.conversationState, state);
@@ -192,10 +197,11 @@ test("a cut after a clean checkpoint resumes from it", async () => {
 
 test("a cut after output that follows the checkpoint fails", async () => {
   const error = truncated();
-  const { promise, calls, failures } = await runScripted([
+  const { promise, calls, failures, resets } = await runScripted([
     { messages: [checkpoint(), textDelta("a")], error },
   ]);
   await assert.rejects(promise, (thrown) => thrown === error);
+  assert.equal(resets.count, 1);
   assert.equal(calls.length, 1);
   assert.equal(decisionOf(failures[0]), "fail/output_since_checkpoint");
 });
@@ -217,13 +223,14 @@ test("a failure before any message resends the original action", async () => {
 });
 
 test("a cut after turnEnded and a terminal checkpoint completes", async () => {
-  const { promise, calls, failures } = await runScripted([
+  const { promise, calls, failures, resets } = await runScripted([
     {
       messages: [textDelta("a"), turnEnded(), checkpoint()],
       error: truncated(),
     },
   ]);
   await promise;
+  assert.equal(resets.count, 0);
   assert.equal(calls.length, 1);
   assert.equal(decisionOf(failures[0]), "complete/terminal_checkpoint");
 });
@@ -252,18 +259,23 @@ test("a clean end without turnEnded after output fails", async () => {
 
 test("a non-transport error is rethrown without a decision", async () => {
   const error = new ConnectError("boom", Code.Internal);
-  const { promise, failures } = await runScripted([
+  const { promise, failures, resets } = await runScripted([
     { messages: [checkpoint()], error },
   ]);
   await assert.rejects(promise, (thrown) => thrown === error);
   assert.equal(failures.length, 0);
+  assert.equal(resets.count, 0);
 });
 
 test("a session abort is rethrown without a decision", async () => {
   const controller = new AbortController();
   const failures: AttemptFailure[] = [];
   let calls = 0;
+  let resets = 0;
   const client: AgentRpcClient = {
+    resetConnection() {
+      resets++;
+    },
     run(_input, options) {
       calls++;
       return (async function* () {
@@ -285,6 +297,7 @@ test("a session abort is rethrown without a decision", async () => {
   await assert.rejects(promise);
   assert.equal(failures.length, 0);
   assert.equal(calls, 1);
+  assert.equal(resets, 0);
 });
 
 test("retries stop at the cap", async () => {
