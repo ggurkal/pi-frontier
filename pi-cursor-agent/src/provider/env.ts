@@ -16,3 +16,9 @@ export const PI_CURSOR_AGENT_MODELS_CACHE_FILE = path.join(
 );
 
 export const PI_CURSOR_AGENT_MODELS_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+
+export const PI_CURSOR_AGENT_LOGS_DIR = path.join(
+  PI_CODING_AGENT_DIR,
+  "cursor-agent",
+  "logs",
+);

@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { after, afterEach, before, test } from "node:test";
+import { Code, ConnectError } from "@connectrpc/connect";
 import type {
   AssistantMessage,
   AssistantMessageEvent,
@@ -25,6 +26,7 @@ import {
   type InjectContextAction,
   InteractionUpdate,
   TextDeltaUpdate,
+  TurnEndedUpdate,
 } from "../../src/__generated__/agent/v1/agent_pb.js";
 import { ExecServerMessage } from "../../src/__generated__/agent/v1/exec_pb.js";
 import { ReadArgs } from "../../src/__generated__/agent/v1/read_exec_pb.js";
@@ -144,6 +146,14 @@ class FakeRun {
     this.sendUpdate(
       new InteractionUpdate({
         message: { case: "textDelta", value: new TextDeltaUpdate({ text }) },
+      }),
+    );
+  }
+
+  turnEnded(): void {
+    this.sendUpdate(
+      new InteractionUpdate({
+        message: { case: "turnEnded", value: new TurnEndedUpdate() },
       }),
     );
   }
@@ -934,4 +944,114 @@ test("a stale flush does not record a snapshot in Pi", async () => {
   assert.equal(appended, 0);
   await session.flushSessionState();
   assert.equal(appended, 1);
+});
+
+const truncated = () =>
+  new ConnectError(
+    "protocol error: missing EndStreamResponse",
+    Code.InvalidArgument,
+  );
+
+async function readStreamErrorLog(
+  sessionId: string,
+): Promise<Array<Record<string, unknown>>> {
+  const { streamErrorLogPath } = await import(
+    "../../src/provider/stream-error-log.js"
+  );
+  const file = streamErrorLogPath(sessionId);
+  assert.ok(file.startsWith(cacheDir));
+  const text = await fs.readFile(file, "utf8").catch(() => "");
+  return text
+    .split("\n")
+    .filter(Boolean)
+    .map((line) => JSON.parse(line));
+}
+
+for (const order of ["checkpoint first", "turnEnded first"] as const) {
+  test(`a stream cut after turnEnded and a current checkpoint ends the turn (${order})`, async () => {
+    const sessionId = newSessionId();
+    const s1 = startStream(sessionId, [user("hello")]);
+    const run = await waitForRun(0);
+    run.text("all done");
+    if (order === "checkpoint first") {
+      run.checkpoint(checkpointState([]));
+      run.turnEnded();
+    } else {
+      run.turnEnded();
+      run.checkpoint(checkpointState([]));
+    }
+    run.fail(truncated());
+
+    const reply = await s1.result();
+    assert.equal(reply.stopReason, "stop");
+    assert.equal(textOf(reply), "all done");
+    const [entry] = await readStreamErrorLog(sessionId);
+    assert.equal(entry?.["outcome"], "completed");
+    assert.equal(entry?.["turnEnded"], true);
+    assert.equal(entry?.["checkpointCurrent"], true);
+    assert.equal(entry?.["runId"], run.headers["x-original-request-id"]);
+  });
+}
+
+test("a stream cut after turnEnded with a stale checkpoint fails the turn", async () => {
+  const sessionId = newSessionId();
+  const s1 = startStream(sessionId, [user("hello")]);
+  const run = await waitForRun(0);
+  run.checkpoint(checkpointState([]));
+  run.text("more output");
+  run.turnEnded();
+  run.fail(truncated());
+
+  const reply = await s1.result();
+  assert.equal(reply.stopReason, "error");
+  assert.match(reply.errorMessage ?? "", /missing EndStreamResponse/);
+  const [entry] = await readStreamErrorLog(sessionId);
+  assert.equal(entry?.["outcome"], "failed");
+  assert.equal(entry?.["checkpointCurrent"], false);
+});
+
+test("a stream cut before turnEnded fails the turn", async () => {
+  const sessionId = newSessionId();
+  const s1 = startStream(sessionId, [user("hello")]);
+  const run = await waitForRun(0);
+  run.text("partial");
+  run.checkpoint(checkpointState([]));
+  run.fail(truncated());
+
+  const reply = await s1.result();
+  assert.equal(reply.stopReason, "error");
+  const [entry] = await readStreamErrorLog(sessionId);
+  assert.equal(entry?.["outcome"], "failed");
+  assert.equal(entry?.["turnEnded"], false);
+});
+
+test("an unrelated error after turnEnded still fails the turn and is not logged", async () => {
+  const sessionId = newSessionId();
+  const s1 = startStream(sessionId, [user("hello")]);
+  const run = await waitForRun(0);
+  run.text("done");
+  run.checkpoint(checkpointState([]));
+  run.turnEnded();
+  run.fail(new ConnectError("boom", Code.Internal));
+
+  const reply = await s1.result();
+  assert.equal(reply.stopReason, "error");
+  assert.deepEqual(await readStreamErrorLog(sessionId), []);
+});
+
+test("an owed steer still runs next after a stream cut that ended the turn", async () => {
+  const sessionId = newSessionId();
+  const { run, history } = await runUntilToolBatch(sessionId);
+  const s2 = startStream(sessionId, [...history, user("s1")]);
+  await run.waitForInjections(1);
+  run.text("finishing");
+  run.checkpoint(checkpointState([]));
+  run.turnEnded();
+  run.fail(truncated());
+
+  const next = await waitForRun(1);
+  assert.equal(next.runText, "s1");
+  next.text(" reply to s1");
+  next.end();
+  assert.equal(textOf(await s2.result()), "finishing reply to s1");
 });
