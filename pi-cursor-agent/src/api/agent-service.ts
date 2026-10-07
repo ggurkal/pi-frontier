@@ -1,5 +1,7 @@
 import {
   type Client,
+  Code,
+  ConnectError,
   createClient,
   type Interceptor,
 } from "@connectrpc/connect";
@@ -26,6 +28,24 @@ function getAbortError(reason?: unknown): Error {
   const error = new Error("Request aborted");
   error.name = "AbortError";
   return error;
+}
+
+/** Connect sends RST_STREAM(CANCEL) only for a `Code.Canceled` reason. */
+export function cancelOnAbort(signal: AbortSignal): AbortSignal {
+  const controller = new AbortController();
+  const abort = () =>
+    controller.abort(
+      new ConnectError(
+        "Request cancelled",
+        Code.Canceled,
+        undefined,
+        undefined,
+        signal.reason,
+      ),
+    );
+  if (signal.aborted) abort();
+  else signal.addEventListener("abort", abort, { once: true });
+  return controller.signal;
 }
 
 export function wrapAbortSafeStream(
@@ -139,7 +159,7 @@ class AgentService {
       ): AsyncIterable<AgentServerMessage> {
         const response = client.run(input, {
           ...(options?.headers ? { headers: options.headers } : {}),
-          ...(options?.signal ? { signal: options.signal } : {}),
+          ...(options?.signal ? { signal: cancelOnAbort(options.signal) } : {}),
         });
 
         if (!options?.signal) {
