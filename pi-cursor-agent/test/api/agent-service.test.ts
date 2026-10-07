@@ -4,9 +4,9 @@ import type { AddressInfo } from "node:net";
 import test from "node:test";
 import { type Client, Code, ConnectError } from "@connectrpc/connect";
 import { createWritableIterable } from "@connectrpc/connect/protocol";
-import type {
+import {
   AgentClientMessage,
-  AgentServerMessage,
+  type AgentServerMessage,
 } from "../../src/__generated__/agent/v1/agent_pb.js";
 import type { AgentService as AgentServiceDef } from "../../src/__generated__/agent/v1/agent_service_connect.js";
 import AgentService, {
@@ -144,11 +144,26 @@ test("an aborted run cancels the HTTP/2 stream with CANCEL", async () => {
   });
 
   try {
+    requests.write(new AgentClientMessage()).catch(() => {});
     const next = stream[Symbol.asyncIterator]().next();
     await new Promise((resolve) => setTimeout(resolve, 50));
     controller.abort(new Error("user cancelled"));
     await assert.rejects(next);
-    assert.equal(await rstCode, http2.constants.NGHTTP2_CANCEL);
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(
+        () => reject(new Error("no RST_STREAM within 1s")),
+        1_000,
+      );
+    });
+    try {
+      assert.equal(
+        await Promise.race([rstCode, timeout]),
+        http2.constants.NGHTTP2_CANCEL,
+      );
+    } finally {
+      clearTimeout(timer);
+    }
     await new Promise((resolve) => setTimeout(resolve, 20));
     assert.deepEqual(unhandled, []);
   } finally {
