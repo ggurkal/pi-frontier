@@ -118,7 +118,8 @@ export class ClientInteractionController {
           queryProto.id,
           coreQuery.type,
         );
-        return this.queryResponseStream.write(responseProto);
+        // A failed write means the run is gone; the run reports why.
+        return this.queryResponseStream.write(responseProto).catch(() => {});
       })
       .catch((error) => {
         console.error("Error handling interaction query", error);

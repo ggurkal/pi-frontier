@@ -50,7 +50,7 @@ test("wrapAbortSafeStream aborts by closing the underlying iterator", async () =
   assert.equal(returnSpy.called, true);
 });
 
-test("rpcClient strips transport signal and still aborts the response stream", async () => {
+test("rpcClient forwards the signal so Connect cancels the stream", async () => {
   const controller = new AbortController();
   const returnSpy = { called: false };
   let seenOptions:
@@ -87,7 +87,10 @@ test("rpcClient strips transport signal and still aborts the response stream", a
     return true;
   });
 
-  assert.deepEqual(seenOptions, { headers: { "x-test": "1" } });
+  assert.deepEqual(seenOptions, {
+    headers: { "x-test": "1" },
+    signal: controller.signal,
+  });
   assert.equal(returnSpy.called, true);
 });
 

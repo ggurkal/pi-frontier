@@ -306,6 +306,70 @@ test("a session abort is rethrown without a decision", async () => {
   assert.equal(resets, 0);
 });
 
+test("a session abort leaves no unhandled write rejections", async () => {
+  const controller = new AbortController();
+  const unhandled: unknown[] = [];
+  const logged: unknown[] = [];
+  const onUnhandled = (reason: unknown) => unhandled.push(reason);
+  const originalError = console.error;
+  process.on("unhandledRejection", onUnhandled);
+  console.error = (...args: unknown[]) => logged.push(args);
+  // Like Connect: on abort, throw into the request iterable (rejecting
+  // pending writes) and fail the response.
+  const client: AgentRpcClient = {
+    run(input, options) {
+      const requests = input[Symbol.asyncIterator]();
+      const signal = options?.signal;
+      return (async function* () {
+        await requests.next();
+        yield new AgentServerMessage({
+          message: {
+            case: "interactionQuery",
+            value: new InteractionQuery({
+              id: 1,
+              query: {
+                case: "askQuestionInteractionQuery",
+                value: new AskQuestionInteractionQuery({
+                  args: new AskQuestionArgs(),
+                  toolCallId: "ask-1",
+                }),
+              },
+            }),
+          },
+        });
+        await new Promise<never>((_resolve, reject) => {
+          signal?.addEventListener("abort", () => {
+            void requests.throw?.(signal.reason);
+            reject(signal.reason);
+          });
+        });
+      })();
+    },
+  };
+  try {
+    const promise = new AgentConnectClient(client).run(initialRequest(), {
+      ...baseRunOptions(),
+      signal: controller.signal,
+      interactionListener: {
+        sendUpdate: async () => {},
+        query: async () => {
+          await new Promise((resolve) => setTimeout(resolve, 30));
+          return { approved: false, reason: "unused" };
+        },
+      },
+    });
+    await new Promise((resolve) => setTimeout(resolve, 10));
+    controller.abort();
+    await assert.rejects(promise);
+    await new Promise((resolve) => setTimeout(resolve, 60));
+  } finally {
+    process.off("unhandledRejection", onUnhandled);
+    console.error = originalError;
+  }
+  assert.deepEqual(unhandled, []);
+  assert.deepEqual(logged, []);
+});
+
 test("retries stop at the cap", async () => {
   const attempts = Array.from({ length: 7 }, () => ({
     messages: [checkpoint()],

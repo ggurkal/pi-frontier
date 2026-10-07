@@ -62,6 +62,9 @@ export class ClientExecController {
             await this.clientStream.write(result);
           }
         })();
+        // Promise.all only runs after the server stream ends; an abort
+        // rejects pending writes before that.
+        promise.catch(() => {});
 
         pendingPromises.push(promise);
       }

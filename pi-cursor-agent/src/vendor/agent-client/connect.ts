@@ -355,7 +355,7 @@ export class AgentConnectClient {
 
     // Queue the initial run request first so replayed mid-stream messages
     // cannot overtake the run handshake on reconnect.
-    void baseRequestStream.write(initialRequest);
+    baseRequestStream.write(initialRequest).catch(() => {});
 
     // Notify consumer after the initial request is queued.
     options.onRequestStreamCreated?.(baseRequestStream);

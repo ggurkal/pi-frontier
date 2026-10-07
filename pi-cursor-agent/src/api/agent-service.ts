@@ -139,6 +139,7 @@ class AgentService {
       ): AsyncIterable<AgentServerMessage> {
         const response = client.run(input, {
           ...(options?.headers ? { headers: options.headers } : {}),
+          ...(options?.signal ? { signal: options.signal } : {}),
         });
 
         if (!options?.signal) {
