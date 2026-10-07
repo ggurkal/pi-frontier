@@ -29,6 +29,8 @@ export class ClientInteractionController {
   private readonly interactionStream: AsyncIterable<InteractionMessage>;
   private readonly interactionListener: InteractionListener;
   private readonly queryResponseStream: Writable<InteractionResponse>;
+  /** Updates are applied in order on this chain; it never rejects. */
+  private tail: Promise<void> = Promise.resolve();
 
   constructor(
     interactionStream: AsyncIterable<InteractionMessage>,
@@ -40,15 +42,19 @@ export class ClientInteractionController {
     this.queryResponseStream = queryResponseStream;
   }
 
+  /** Settles once every update read so far has been applied. */
+  whenIdle(): Promise<void> {
+    return this.tail;
+  }
+
   async run(ctx: unknown): Promise<void> {
-    let promise = Promise.resolve();
     let firstError: Error | undefined;
 
     for await (const message of this.interactionStream) {
       if (message.case === "interactionQuery") {
         this.handleInteractionQuery(ctx, message.value);
       } else if (message.case === "interactionUpdate") {
-        promise = promise
+        this.tail = this.tail
           .then(() => this.handleInteractionUpdate(ctx, message.value))
           .catch((error: unknown) => {
             console.error("Error handling interaction update", error);
@@ -58,7 +64,7 @@ export class ClientInteractionController {
       }
     }
 
-    await promise;
+    await this.tail;
     if (firstError !== undefined) {
       throw firstError;
     }

@@ -359,6 +359,7 @@ export class AgentConnectClient {
         channels.checkpointStream,
         options.checkpointHandler,
         null,
+        () => interactionController.whenIdle(),
       );
 
       const ctx = null;
