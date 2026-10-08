@@ -27,6 +27,32 @@ export const PI_CURSOR_AGENT_LOGS_DIR = path.join(
   "logs",
 );
 
+/**
+ * Cursor project slug: absolute path with every non-alphanumeric run collapsed
+ * to one dash. `/home/ada/.config/ghostty` becomes `home-ada-config-ghostty`.
+ */
+export function slugifyCursorProjectPath(workspacePath: string): string {
+  return path
+    .resolve(workspacePath)
+    .replace(/[^a-zA-Z0-9]/g, "-")
+    .split("-")
+    .filter((part) => part.length > 0)
+    .join("-");
+}
+
+/** Metadata root Cursor uses for `agent-tools/`. */
+export function cursorProjectDir(
+  workspacePath: string,
+  agentDir: string = PI_CODING_AGENT_DIR,
+): string {
+  return path.join(
+    agentDir,
+    "cursor-agent",
+    "projects",
+    slugifyCursorProjectPath(workspacePath),
+  );
+}
+
 /** Unset or invalid: Cursor's default. `0` or less disables stall detection. */
 export function parseStallTimeout(raw: string | undefined): number {
   const value =

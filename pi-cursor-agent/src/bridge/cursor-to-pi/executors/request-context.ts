@@ -1,4 +1,6 @@
+import { mkdir } from "node:fs/promises";
 import os from "node:os";
+import path from "node:path";
 import type { CursorRule } from "../../../__generated__/agent/v1/cursor_rules_pb";
 import type { McpToolDefinition } from "../../../__generated__/agent/v1/mcp_pb";
 import { GitRepoInfo } from "../../../__generated__/agent/v1/repo_pb";
@@ -10,6 +12,7 @@ import {
   RequestContextResult,
   RequestContextSuccess,
 } from "../../../__generated__/agent/v1/request_context_exec_pb";
+import { cursorProjectDir } from "../../../provider/env";
 import type { Executor } from "../../../vendor/agent-exec";
 import {
   getGitBranch,
@@ -116,12 +119,18 @@ export class LocalRequestContextExecutor
       timeZone = undefined;
     }
 
+    const projectFolder = cursorProjectDir(
+      this.workspacePaths[0] ?? process.cwd(),
+    );
+    await mkdir(path.join(projectFolder, "agent-tools"), { recursive: true });
+
     return new RequestContextEnv({
       osVersion,
       workspacePaths: this.workspacePaths,
       shell,
       sandboxEnabled: false,
       timeZone: timeZone ?? "",
+      projectFolder,
     });
   }
 }
